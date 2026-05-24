@@ -81,6 +81,9 @@ class Terminal(TerminalBase):
             if _msvcrt.kbhit():
                 self._read_event_terminal()
                 activity = True
+            if self._tx_buf:
+                self._flush_tx()
+                activity = True
             if self._conn._has_data(0):
                 self._read_event_device()
                 activity = True

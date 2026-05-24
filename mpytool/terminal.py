@@ -16,6 +16,10 @@ class TerminalBase:
         self._log = log
         self._conn = conn
         self._running = None
+        # Pending keystrokes to send to device. Buffered here and flushed only
+        # when the connection fd is writable, so a blocking write (e.g. device
+        # not draining USB-CDC) never stalls the loop and breaks Ctrl+] exit.
+        self._tx_buf = bytearray()
 
     def _setup(self):
         """Set terminal to raw mode (platform-specific)"""
@@ -43,7 +47,17 @@ class TerminalBase:
             self._running = False
             return
         if data:
-            self._conn.write(data)
+            self._tx_buf += data
+
+    def _flush_tx(self):
+        """Send buffered keystrokes to device (blocking write).
+
+        Platforms that gate this on fd writability avoid blocking; the base
+        implementation is used where writability can't be polled.
+        """
+        if self._tx_buf:
+            self._conn.write(bytes(self._tx_buf))
+            del self._tx_buf[:]
 
     def _read_event_device(self):
         data = self._conn.read()
