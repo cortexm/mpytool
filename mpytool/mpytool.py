@@ -473,6 +473,9 @@ class MpyTool():
         self.verbose("REPL (Ctrl+] to exit)", 1)
         terminal = _terminal.Terminal(self.conn, self._log)
         terminal.run()
+        # Drop keystrokes the device never consumed, so close() doesn't block
+        # waiting to drain the kernel TX buffer.
+        self.conn.discard_output()
         self._log.info('Exiting..')
 
     def cmd_ota(self, firmware_path):

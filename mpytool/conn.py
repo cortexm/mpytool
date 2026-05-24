@@ -208,6 +208,13 @@ class Conn():
     def close(self):
         """Close connection"""
 
+    def discard_output(self):
+        """Discard buffered output not yet transmitted (no-op by default).
+
+        Serial connections override this; needed before closing a port with
+        undeliverable queued data, otherwise close() blocks waiting to drain.
+        """
+
     def hard_reset(self):
         """Hardware reset (only available on serial connections)"""
         raise NotImplementedError("Hardware reset not available on this connection")

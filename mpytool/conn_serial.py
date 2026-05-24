@@ -46,6 +46,19 @@ class ConnSerial(_conn.Conn):
     def __del__(self):
         self.close()
 
+    def discard_output(self):
+        """Discard kernel TX buffer (data written but not yet transmitted).
+
+        Without this, closing the port blocks while the kernel waits to drain
+        output the device never consumed (e.g. keystrokes sent to a device not
+        reading its USB-CDC, after leaving the REPL).
+        """
+        if self._serial:
+            try:
+                self._serial.reset_output_buffer()
+            except OSError:
+                pass
+
     @property
     def fd(self):
         return self._serial.fd if self._serial else None
