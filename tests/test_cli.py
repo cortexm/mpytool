@@ -137,6 +137,12 @@ class TestCliHelp(unittest.TestCase):
             'soft' in result.stdout.lower() or
             'hard' in result.stdout.lower())
 
+    def test_wipe_help(self):
+        """mpytool wipe --help shows wipe usage"""
+        result = run_mpytool('wipe', '--help')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('erase', result.stdout.lower())
+
     def test_mount_help(self):
         """mpytool mount --help shows mount usage"""
         result = run_mpytool('mount', '--help')

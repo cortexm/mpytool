@@ -892,7 +892,7 @@ Soft reset in raw REPL mode (clears RAM only, doesn't run boot.py/main.py).
 mpy.soft_reset_raw()
 ```
 
-#### machine_reset(reconnect=True)
+#### machine_reset(reconnect=True, timeout=None)
 
 MCU reset using `machine.reset()`.
 
@@ -902,6 +902,7 @@ mpy.machine_reset(reconnect=True)
 
 **Parameters:**
 - `reconnect` (bool): If True, attempt to reconnect after reset (for USB-CDC ports)
+- `timeout` (int): Reconnect timeout in seconds (None = default)
 
 #### hard_reset()
 
@@ -913,6 +914,34 @@ mpy.hard_reset()
 
 **Raises:**
 - `NotImplementedError`: If connection doesn't support hardware reset
+
+#### wipe(reconnect=True, timeout=None, on_delete=None)
+
+Erase all files from the filesystem root, then `machine.reset()` the device.
+
+Recursively deletes every entry in `/`, then performs a full machine reset so
+runtime state (open sockets, WiFi, mounted VFS) is dropped too — a soft reset
+would leave those alive. Intended for a clean slate, e.g. at the start of
+integration tests.
+
+```python
+# Clean slate at the start of a test
+mpy.wipe()
+
+# Wipe without waiting to reconnect
+mpy.wipe(reconnect=False)
+
+# Show what gets removed
+mpy.wipe(on_delete=lambda path: print(f"removing {path}"))
+```
+
+**Parameters:**
+- `reconnect` (bool): If True, wait for the device to come back after reset
+- `timeout` (int): Reconnect timeout in seconds (None = default)
+- `on_delete` (callable): Optional `callback(path)` invoked before each delete
+
+**Returns:**
+- `bool`: True if reconnected after reset, False otherwise
 
 ### Flash/Partition Methods
 

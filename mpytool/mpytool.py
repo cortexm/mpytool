@@ -31,7 +31,7 @@ else:
 # Order of commands in help and completion
 _CMD_ORDER = [
     'ls', 'tree', 'cat', 'cp', 'mv', 'mkdir', 'rm', 'pwd', 'cd', 'path',
-    'stop', 'reset', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
+    'stop', 'reset', 'wipe', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
     'rtc', 'flash', 'mount', 'ln', 'speedtest', 'sleep', 'ports',
 ]
 
@@ -770,6 +770,21 @@ class MpyTool():
             except (NotImplementedError, _mpytool.ConnError) as err:
                 raise _mpytool.MpyError(f"Bootloader reset failed: {err}")
 
+    def cmd_wipe(self, reconnect=True, timeout=None):
+        """Erase all files from root, then machine-reset the device"""
+        self.verbose("WIPE", 1)
+        try:
+            self.mpy.wipe(
+                reconnect=reconnect, timeout=timeout,
+                on_delete=lambda path: self.verbose(f"  rm {path}", 1))
+        except (_mpytool.ConnError, OSError) as err:
+            self.verbose(f"  reconnect failed: {err}", 1, color='red')
+            raise _mpytool.ConnError(f"Reconnect failed: {err}")
+        if reconnect:
+            self.verbose("  reset, reconnected", 1, color='green')
+        else:
+            self.verbose("  reset", 1)
+
     @command('ls', 'List files and directories on device.')
     @argument('path', nargs='?', default=':', metavar='remote',
         type=_normalize_path_arg, help='device path (default: CWD)')
@@ -921,6 +936,18 @@ class MpyTool():
         has_more = bool(commands) or not is_last_group
         reconnect = has_more if mode in ('machine', 'rts') else True
         self.cmd_reset(mode=mode, reconnect=reconnect, timeout=args.timeout)
+
+    @command('wipe', 'Erase ALL files and machine-reset the device.')
+    @option('-y', '--yes', action='store_true',
+        help='no-op (wipe never prompts), accepted for convenience')
+    @option('-t', '--timeout', type=int,
+        help='reconnect timeout in seconds')
+    def _dispatch_wipe(self, commands, is_last_group):
+        args, commands[:] = _make_parser(
+            self._dispatch_wipe).parse_known_args(commands)
+        # Reconnect only if more work follows; pointless if wipe is last.
+        has_more = bool(commands) or not is_last_group
+        self.cmd_wipe(reconnect=has_more, timeout=args.timeout)
 
     @command('monitor', 'Monitor device output until program ends.')
     @option('-f', '--follow', action='store_true',
@@ -1441,7 +1468,7 @@ class MpyTool():
 
     _COMMANDS = frozenset({
         'ls', 'tree', 'cat', 'mkdir', 'rm', 'pwd', 'cd', 'path',
-        'reset', 'stop', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
+        'reset', 'wipe', 'stop', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
         'rtc', 'flash', 'sleep', 'cp', 'mv', 'mount', 'ln', 'speedtest',
         'ports', '_paths', '_commands', '_options', '_args',
     })

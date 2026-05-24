@@ -16,6 +16,8 @@ It is an alternative to the official [mpremote](https://docs.micropython.org/en/
   (CP2102, CH340)
 - **Multiple reset options** - soft, MCU, hardware (RTS),
   bootloader entry
+- **Wipe device** - erase the whole filesystem and machine-reset
+  for a clean slate (handy at the start of automated tests)
 - **General-purpose serial terminal** - `repl` and `monitor` work
   with any serial device
 - **Mount local directory** - VFS mount (read-only or read-write)
@@ -254,6 +256,30 @@ REPL (Ctrl+] to exit)
 $ mpytool sleep 2            # sleep for 2 seconds (useful between commands)
 SLEEP 2.0s
 ```
+
+### Wipe device (erase all files + machine reset)
+```
+$ mpytool wipe               # delete everything from / then machine.reset()
+WIPE
+  rm /boot.py
+  rm /main.py
+  rm /lib
+  reset
+
+$ mpytool wipe -- ls         # wipe, reconnect, then list (now empty)
+WIPE
+  rm /main.py
+  reset, reconnected
+LS:
+```
+
+`wipe` erases the whole filesystem (recursive delete of `/`) and then does a
+full `machine.reset()` — a soft reset would leave open sockets, WiFi and
+mounted VFS alive, so machine reset is used for a true clean slate. It **never
+prompts** (mpytool has no interactive mode); `-y`/`--yes` is accepted as a
+no-op. When `wipe` is the last command it just resets and exits; when more
+commands follow it reconnects first (use `-t SECONDS` for the reconnect
+timeout). See [README_API.md](README_API.md) for `Mpy.wipe()`.
 
 ### Serial terminal and monitor (general purpose)
 ```

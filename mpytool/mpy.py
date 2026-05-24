@@ -1329,6 +1329,29 @@ def _mt_pfind(label):
             return True
         return False
 
+    def wipe(self, reconnect=True, timeout=None, on_delete=None):
+        """Erase all files from filesystem root, then machine-reset device
+
+        Deletes every entry in '/' recursively, then performs a full
+        machine.reset() so runtime state (open sockets, WiFi, mounted VFS,
+        etc.) is dropped too - a soft reset would leave those alive. Intended
+        for a clean slate, e.g. at the start of integration tests.
+
+        Arguments:
+            reconnect: if True, wait for the device to come back after reset
+            timeout: reconnect timeout in seconds (None = default)
+            on_delete: optional callback(path) invoked before each delete
+
+        Returns:
+            True if reconnected after reset, False otherwise
+        """
+        for name, _ in self.ls('/'):
+            path = '/' + name
+            if on_delete is not None:
+                on_delete(path)
+            self.delete(path)
+        return self.machine_reset(reconnect=reconnect, timeout=timeout)
+
     def machine_bootloader(self):
         """Enter bootloader using machine.bootloader()
 

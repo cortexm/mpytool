@@ -484,6 +484,61 @@ class TestChdir(unittest.TestCase):
         self.assertIn("os.chdir('..')", call_args)
 
 
+class TestWipe(unittest.TestCase):
+    """Tests for Mpy.wipe method"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+        self.mpy._mpy_comm = Mock()
+        # wipe orchestrates ls/delete/machine_reset; stub them to verify flow
+        self.mpy.ls = Mock(return_value=[])
+        self.mpy.delete = Mock()
+        self.mpy.machine_reset = Mock(return_value=True)
+
+    def test_wipe_deletes_all_root_entries(self):
+        """wipe deletes every root entry using an absolute path"""
+        self.mpy.ls.return_value = [('lib', None), ('boot.py', 42)]
+        self.mpy.wipe()
+        self.mpy.ls.assert_called_once_with('/')
+        self.mpy.delete.assert_any_call('/lib')
+        self.mpy.delete.assert_any_call('/boot.py')
+        self.assertEqual(self.mpy.delete.call_count, 2)
+
+    def test_wipe_machine_resets_with_args(self):
+        """wipe forwards reconnect/timeout to machine_reset"""
+        result = self.mpy.wipe(reconnect=True, timeout=5)
+        self.mpy.machine_reset.assert_called_once_with(
+            reconnect=True, timeout=5)
+        self.assertTrue(result)
+
+    def test_wipe_empty_filesystem_still_resets(self):
+        """wipe on empty FS deletes nothing but still resets"""
+        self.mpy.machine_reset.return_value = False
+        result = self.mpy.wipe(reconnect=False)
+        self.mpy.delete.assert_not_called()
+        self.mpy.machine_reset.assert_called_once_with(
+            reconnect=False, timeout=None)
+        self.assertFalse(result)
+
+    def test_wipe_invokes_on_delete_callback(self):
+        """on_delete is called with each path before deletion"""
+        self.mpy.ls.return_value = [('a.py', 1), ('b.py', 2)]
+        seen = []
+        self.mpy.wipe(on_delete=seen.append)
+        self.assertEqual(seen, ['/a.py', '/b.py'])
+
+    def test_wipe_deletes_before_reset(self):
+        """all deletes happen before the machine reset"""
+        calls = []
+        self.mpy.ls.return_value = [('x', 1)]
+        self.mpy.delete.side_effect = lambda p: calls.append(('del', p))
+        self.mpy.machine_reset.side_effect = (
+            lambda **k: calls.append(('reset',)) or True)
+        self.mpy.wipe()
+        self.assertEqual(calls, [('del', '/x'), ('reset',)])
+
+
 class TestExecSubmitOnly(unittest.TestCase):
     """Tests for exec() and exec_raw_paste() with timeout=0 (submit only)"""
 
