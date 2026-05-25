@@ -20,8 +20,10 @@ import unittest
 
 
 # Test ports for different test levels
-PORT_RO = os.environ.get("MPYTOOL_TEST_PORT")
-PORT_RW = os.environ.get("MPYTOOL_TEST_PORT_RW")
+# .strip() guards against trailing whitespace/CR from how the runner writes
+# the port into its config file (Windows `set /p` keeps trailing spaces).
+PORT_RO = (os.environ.get("MPYTOOL_TEST_PORT") or "").strip() or None
+PORT_RW = (os.environ.get("MPYTOOL_TEST_PORT_RW") or "").strip() or None
 
 # RW implies RO
 if PORT_RW:
@@ -255,7 +257,10 @@ class TestCliReadOnly(unittest.TestCase):
 
     def test_tree_root(self):
         """tree :/ shows tree structure"""
-        result = run_mpytool('-p', self.DEVICE_PORT, 'tree', ':/')
+        # tree recurses the whole filesystem and returns it in one round-trip;
+        # on a populated device over a slow serial link this needs more than
+        # the default 10s.
+        result = run_mpytool('-p', self.DEVICE_PORT, 'tree', ':/', timeout=30)
         self.assertEqual(result.returncode, 0)
 
     def test_pwd(self):

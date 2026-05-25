@@ -20,8 +20,10 @@ import mpytool.logger as _logger
 _QUIET_LOG = _logger.SimpleColorLogger(loglevel=_logger.ERROR)
 
 # Test ports for different test levels
-PORT_RO = os.environ.get("MPYTOOL_TEST_PORT")
-PORT_RW = os.environ.get("MPYTOOL_TEST_PORT_RW")
+# .strip() guards against trailing whitespace/CR from how the runner writes
+# the port into its config file (Windows `set /p` keeps trailing spaces).
+PORT_RO = (os.environ.get("MPYTOOL_TEST_PORT") or "").strip() or None
+PORT_RW = (os.environ.get("MPYTOOL_TEST_PORT_RW") or "").strip() or None
 
 # RW implies RO
 if PORT_RW:
