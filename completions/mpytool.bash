@@ -272,6 +272,13 @@ _mpytool() {
                 fi
             fi
             ;;
+        sync)
+            # Optional local project directory, -- for chaining
+            if [[ $pos -eq 2 ]]; then
+                COMPREPLY=($(compgen -d -- "$cur"))
+            fi
+            [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
+            ;;
         exec)
             # 1 code string, -- after it
             [[ $nargs -ge 1 && ( -z "$cur" || "--" == "$cur"* ) ]] && COMPREPLY+=("--")

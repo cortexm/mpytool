@@ -1004,5 +1004,137 @@ class TestRtcCommand(unittest.TestCase):
             mock_dt.datetime.now.assert_called_with(mock_dt.timezone.utc)
 
 
+class TestSyncCommand(unittest.TestCase):
+    """Tests for sync command (deploy project per .mpyproject)"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.tool = MpyTool(Mock(), verbose=None)
+        # Capture cp invocations and the CWD active at call time
+        self.cp_calls = []
+        self.tool.cmd_cp = lambda args: self.cp_calls.append(
+            (os.path.basename(os.getcwd()), list(args)))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_project(self, content, subdir=''):
+        """Create a .mpyproject with given content, return its directory"""
+        root = os.path.join(self.tmpdir, subdir) if subdir else self.tmpdir
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, '.mpyproject'), 'w') as file:
+            file.write(content)
+        return root
+
+    def test_default_deploy(self):
+        """Missing deploy key -> default './' to root"""
+        root = self._write_project('{"name": "demo"}')
+        self.tool.cmd_sync(root)
+        self.assertEqual([args for _, args in self.cp_calls], [['./', ':']])
+
+    def test_deploy_dir_and_rename(self):
+        """Dir mode list + rename mode string translate to cp jobs"""
+        root = self._write_project(
+            '{"deploy": {"/lib/": ["a.py", "b.py"], "/main.py": "src/m.py"}}')
+        self.tool.cmd_sync(root)
+        self.assertEqual(
+            [args for _, args in self.cp_calls],
+            [['a.py', 'b.py', ':/lib/'], ['src/m.py', ':/main.py']])
+
+    def test_compile_flag(self):
+        """compile:true prepends -m to every cp job"""
+        root = self._write_project(
+            '{"compile": true, "deploy": {"": ["./"]}}')
+        self.tool.cmd_sync(root)
+        self.assertEqual(self.cp_calls[0][1], ['-m', './', ':'])
+
+    def test_dedupe_sources(self):
+        """Duplicate sources in dir mode are removed, order preserved"""
+        root = self._write_project(
+            '{"deploy": {"": ["./", "./", "x.py"]}}')
+        self.tool.cmd_sync(root)
+        self.assertEqual(self.cp_calls[0][1], ['./', 'x.py', ':'])
+
+    def test_exclude_merged(self):
+        """exclude patterns from config merge into instance excludes"""
+        root = self._write_project(
+            '{"deploy": {"": ["./"]}, "exclude": ["*.bak", "tmp"]}')
+        self.tool.cmd_sync(root)
+        self.assertIn('*.bak', self.tool._exclude_dirs)
+        self.assertIn('tmp', self.tool._exclude_dirs)
+
+    def test_trailing_comma_tolerated(self):
+        """JSON with trailing commas still loads"""
+        root = self._write_project('{"deploy": {"": ["./"],},}')
+        self.tool.cmd_sync(root)
+        self.assertEqual(self.cp_calls[0][1], ['./', ':'])
+
+    def test_runs_from_project_root(self):
+        """cp jobs run with project root as CWD; CWD restored afterwards"""
+        root = self._write_project('{"deploy": {"": ["./"]}}', subdir='myproj')
+        prev = os.getcwd()
+        self.tool.cmd_sync(root)
+        self.assertEqual(self.cp_calls[0][0], 'myproj')
+        self.assertEqual(os.getcwd(), prev)
+
+    def test_search_upward(self):
+        """.mpyproject is found by searching parent directories"""
+        root = self._write_project('{"deploy": {"": ["./"]}}', subdir='app')
+        deep = os.path.join(root, 'pkg', 'mod')
+        os.makedirs(deep)
+        self.tool.cmd_sync(deep)
+        self.assertEqual(self.cp_calls[0][0], 'app')
+
+    def test_no_mpyproject(self):
+        """Missing .mpyproject raises ParamsError"""
+        empty = os.path.join(self.tmpdir, 'empty')
+        os.makedirs(empty)
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(empty)
+        self.assertIn('.mpyproject', str(ctx.exception))
+
+    def test_path_not_found(self):
+        """Nonexistent path raises ParamsError"""
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(os.path.join(self.tmpdir, 'nope'))
+        self.assertIn('not found', str(ctx.exception))
+
+    def test_invalid_json(self):
+        """Malformed JSON raises ParamsError"""
+        root = self._write_project('{ not valid }')
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(root)
+        self.assertIn('invalid JSON', str(ctx.exception))
+
+    def test_dir_mode_string_invalid(self):
+        """Directory dest with string source is a config error"""
+        root = self._write_project('{"deploy": {"/lib/": "single.py"}}')
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(root)
+        self.assertIn('must be a list', str(ctx.exception))
+
+    def test_rename_mode_list_invalid(self):
+        """Rename dest with list source is a config error"""
+        root = self._write_project('{"deploy": {"/main.py": ["a.py"]}}')
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(root)
+        self.assertIn('must be a single string', str(ctx.exception))
+
+    def test_nothing_to_deploy(self):
+        """Deploy entries with only empty sources -> nothing to deploy"""
+        root = self._write_project('{"deploy": {"/lib/": []}}')
+        with self.assertRaises(ParamsError) as ctx:
+            self.tool.cmd_sync(root)
+        self.assertIn('nothing to deploy', str(ctx.exception))
+
+    def test_dispatch_sync(self):
+        """_dispatch_sync parses optional directory and consumes commands"""
+        root = self._write_project('{"deploy": {"": ["./"]}}')
+        commands = [root]
+        self.tool._dispatch_sync(commands, True)
+        self.assertEqual(commands, [])
+        self.assertEqual(self.cp_calls[0][1], ['./', ':'])
+
+
 if __name__ == "__main__":
     unittest.main()

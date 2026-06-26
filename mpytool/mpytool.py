@@ -4,7 +4,9 @@ import argparse as _argparse
 import datetime as _datetime
 import fnmatch as _fnmatch
 import importlib.metadata as _metadata
+import json as _json
 import os as _os
+import re as _re
 import shlex as _shlex
 import subprocess as _subprocess
 import sys as _sys
@@ -30,7 +32,7 @@ else:
 
 # Order of commands in help and completion
 _CMD_ORDER = [
-    'ls', 'tree', 'cat', 'cp', 'mv', 'mkdir', 'rm', 'pwd', 'cd', 'path',
+    'ls', 'tree', 'cat', 'cp', 'sync', 'mv', 'mkdir', 'rm', 'pwd', 'cd', 'path',
     'stop', 'reset', 'wipe', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
     'rtc', 'flash', 'mount', 'ln', 'speedtest', 'sleep', 'ports',
 ]
@@ -55,6 +57,48 @@ def _join_remote_path(base, name):
 def _remote_basename(path):
     """Get basename from remote path"""
     return path.rstrip('/').split('/')[-1]
+
+
+def _find_mpyproject(path):
+    """Find .mpyproject searching upward from path (file or directory).
+
+    Mirrors the Sublime plugin: walks parent directories, skipping any
+    .backup directory (which may hold a .mpyproject downloaded from a
+    device). Returns the path to .mpyproject or None.
+    """
+    path = _os.path.abspath(path)
+    directory = path if _os.path.isdir(path) else _os.path.dirname(path)
+    while directory and directory != _os.path.dirname(directory):
+        if _os.path.basename(directory) == '.backup':
+            directory = _os.path.dirname(directory)
+            continue
+        candidate = _os.path.join(directory, '.mpyproject')
+        if _os.path.exists(candidate):
+            return candidate
+        directory = _os.path.dirname(directory)
+    return None
+
+
+def _load_mpyproject(path):
+    """Load .mpyproject JSON config.
+
+    Tolerates trailing commas (common, not strictly valid JSON), like the
+    Sublime plugin. Returns the parsed dict, {} for an empty file, or None
+    on a JSON syntax error.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            content = file.read().strip()
+    except OSError:
+        return {}
+    if not content:
+        return {}
+    # Remove trailing commas before } or ] (tolerated, not valid JSON)
+    content = _re.sub(r',\s*([}\]])', r'\1', content)
+    try:
+        return _json.loads(content)
+    except _json.JSONDecodeError:
+        return None
 
 
 def _normalize_path_arg(value):
@@ -785,6 +829,77 @@ class MpyTool():
         else:
             self.verbose("  reset", 1)
 
+    def cmd_sync(self, project_dir=None):
+        """Deploy a project to the device per its .mpyproject config.
+
+        Reads the deploy map / exclude / compile settings from .mpyproject
+        (found in project_dir or the current directory, searched upward) and
+        runs the corresponding cp operations. Non-interactive: the connection
+        comes from the global -p / -a options.
+        """
+        start = project_dir if project_dir else '.'
+        if not _os.path.exists(start):
+            raise ParamsError(f"path not found: {start}")
+        mpyproject = _find_mpyproject(start)
+        if not mpyproject:
+            raise ParamsError(
+                f"no .mpyproject found in '{start}' or any parent directory")
+        config = _load_mpyproject(mpyproject)
+        if config is None:
+            raise ParamsError(f"invalid JSON in {mpyproject}")
+        root = _os.path.dirname(mpyproject) or '.'
+        name = config.get('name') or _os.path.basename(_os.path.abspath(root))
+        self.verbose(f"SYNC: {name} ({mpyproject})", 1)
+        # Merge config exclude patterns into the active exclude set
+        for pattern in config.get('exclude', []):
+            self._exclude_dirs.add(pattern)
+        compile_mpy = config.get('compile', False)
+        # deploy map: {"": ["./"], "/lib/": ["../x.py"]}
+        # dir mode (dest is "" or ends with "/"): sources is a list
+        # rename mode (dest does not end with "/"): sources is a single string
+        deploy = config.get('deploy') or {"": ["./"]}
+        cp_jobs = self._build_sync_jobs(deploy, mpyproject)
+        if not cp_jobs:
+            raise ParamsError(
+                f"nothing to deploy, configure 'deploy' in {mpyproject}")
+        # Sources are relative to the project root - run cp from there
+        prev_cwd = _os.getcwd()
+        try:
+            _os.chdir(root)
+            for sources, dest in cp_jobs:
+                cp_args = ['-m'] if compile_mpy else []
+                cp_args.extend(sources)
+                cp_args.append(dest)
+                self.cmd_cp(cp_args)
+        finally:
+            _os.chdir(prev_cwd)
+
+    @staticmethod
+    def _build_sync_jobs(deploy, mpyproject):
+        """Translate a .mpyproject deploy map into (sources, dest) cp jobs"""
+        jobs = []
+        for dest, sources in deploy.items():
+            if not sources:
+                continue
+            is_dir_mode = dest == "" or dest.endswith("/")
+            if is_dir_mode and not isinstance(sources, list):
+                raise ParamsError(
+                    f"deploy '{dest}' is a directory, sources must be a list "
+                    f"(in {mpyproject})")
+            if not is_dir_mode and not isinstance(sources, str):
+                raise ParamsError(
+                    f"deploy '{dest}' is a rename, sources must be a single "
+                    f"string (in {mpyproject})")
+            if is_dir_mode:
+                # Drop empties, dedupe while preserving order
+                srcs = list(dict.fromkeys(s for s in sources if s))
+            else:
+                srcs = [sources]
+            if not srcs:
+                continue
+            jobs.append((srcs, f":{dest}"))
+        return jobs
+
     @command('ls', 'List files and directories on device.')
     @argument('path', nargs='?', default=':', metavar='remote',
         type=_normalize_path_arg, help='device path (default: CWD)')
@@ -1186,6 +1301,14 @@ class MpyTool():
         self.cmd_cp(commands)
         commands.clear()
 
+    @command('sync', 'Deploy project to device per .mpyproject config.')
+    @argument('dir', nargs='?', metavar='project_dir',
+        help='project directory (default: current, searched upward)')
+    def _dispatch_sync(self, commands, is_last_group):
+        args = _make_parser(self._dispatch_sync).parse_args(commands)
+        commands.clear()
+        self.cmd_sync(args.dir)
+
     @command('mv', 'Move or rename files on device.')
     @argument('paths', nargs='+', metavar='remote',
         type=_normalize_path_arg, help='source(s) and destination (all with : prefix)')
@@ -1469,7 +1592,7 @@ class MpyTool():
     _COMMANDS = frozenset({
         'ls', 'tree', 'cat', 'mkdir', 'rm', 'pwd', 'cd', 'path',
         'reset', 'wipe', 'stop', 'monitor', 'repl', 'exec', 'run', 'edit', 'info',
-        'rtc', 'flash', 'sleep', 'cp', 'mv', 'mount', 'ln', 'speedtest',
+        'rtc', 'flash', 'sleep', 'cp', 'sync', 'mv', 'mount', 'ln', 'speedtest',
         'ports', '_paths', '_commands', '_options', '_args',
     })
 

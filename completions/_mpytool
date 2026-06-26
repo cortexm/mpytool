@@ -269,6 +269,13 @@ _mpytool() {
                         fi
                     fi
                     ;;
+                sync)
+                    # Optional local project directory, -- anytime
+                    if [[ $pos -eq 2 ]]; then
+                        _files -/
+                    fi
+                    compadd -- '--'
+                    ;;
                 exec)
                     # 1 code string, -- after it
                     [[ $nargs -ge 1 ]] && compadd -- '--'

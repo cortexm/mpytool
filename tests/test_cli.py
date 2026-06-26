@@ -100,6 +100,19 @@ class TestCliHelp(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(':', result.stdout)
 
+    def test_sync_help(self):
+        """mpytool sync --help shows sync usage and project_dir argument"""
+        result = run_mpytool('sync', '--help')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('project_dir', result.stdout)
+
+    def test_sync_no_mpyproject(self):
+        """mpytool sync in a directory without .mpyproject errors clearly"""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_mpytool('sync', tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('.mpyproject', result.stdout + result.stderr)
+
     def test_mv_help(self):
         """mpytool mv --help shows mv usage"""
         result = run_mpytool('mv', '--help')

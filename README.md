@@ -18,6 +18,9 @@ It is an alternative to the official [mpremote](https://docs.micropython.org/en/
   bootloader entry
 - **Wipe device** - erase the whole filesystem and machine-reset
   for a clean slate (handy at the start of automated tests)
+- **Deploy projects** - `sync` uploads a whole project to the device
+  using a `.mpyproject` config file (deploy map, excludes, `.mpy`
+  compilation)
 - **General-purpose serial terminal** - `repl` and `monitor` work
   with any serial device
 - **Mount local directory** - VFS mount (read-only or read-write)
@@ -152,6 +155,47 @@ Compiled files are cached in `__pycache__/` (recompiled only when source changes
 Requires `mpy-cross` in PATH (`pip install mpy-cross`). If mpy-cross version differs
 from device, automatically uses `-b` flag to target the correct bytecode version.
 If `mpy-cross` is not found, falls back to uploading `.py` with a warning.
+
+### Deploy project (sync)
+
+`sync` uploads a whole project to the device based on a `.mpyproject`
+configuration file. It is the command-line counterpart of the deploy feature in
+the [Sublime Text plugin](https://github.com/cortexm/mpytool-sublime) and shares
+the same `.mpyproject` format. Unlike the plugin it is non-interactive: when more
+than one device is connected, pass `-p` to pick the port.
+
+```
+$ mpytool sync                  # deploy project in CWD (.mpyproject searched upward)
+$ mpytool sync ~/projects/blink # deploy a project in another directory
+$ mpytool -p /dev/ttyACM0 sync  # pick port explicitly (multiple devices)
+$ mpytool sync -- reset -- monitor   # deploy, then reset and watch output
+```
+
+The `.mpyproject` file (JSON, trailing commas tolerated) describes what to upload:
+
+```json
+{
+    "name": "blink",
+    "compile": true,
+    "deploy": {
+        "": ["./"],
+        "/lib/": ["../shared/utils.py"],
+        "/main.py": "src/main_dev.py"
+    },
+    "exclude": ["*.bak", "tests"]
+}
+```
+
+- `deploy` maps a device destination to its source(s), relative to the project
+  root. A key of `""` or one ending in `/` is a **directory** (value is a list of
+  sources); any other key is a **rename** (value is a single source file).
+  Defaults to `{"": ["./"]}` (whole project to root) when omitted.
+- `compile: true` compiles `.py` to `.mpy` (same as `cp -m`).
+- `exclude` adds ignore patterns on top of the defaults (`__pycache__`, `*.pyc`,
+  dotfiles). Combined with global `-e` patterns.
+
+The connection fields (`port`, `address`) used by the Sublime plugin are ignored
+by the CLI — use the global `-p` / `-a` options instead.
 
 ### Move/rename on device
 ```
