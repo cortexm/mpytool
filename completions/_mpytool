@@ -281,11 +281,12 @@ _mpytool() {
                     [[ $nargs -ge 1 ]] && compadd -- '--'
                     ;;
                 run)
-                    # 1 local .py file, -- after it
+                    # optional local .py file or '-' for STDIN, -- after it
                     if [[ $pos -eq 2 ]]; then
                         _files -g '*.py'
+                        compadd -- '-'
                     fi
-                    [[ $nargs -ge 1 ]] && compadd -- '--'
+                    compadd -- '--'
                     ;;
                 edit)
                     # --editor CMD + 1 remote file, -- after file

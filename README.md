@@ -371,6 +371,35 @@ RUN: script.py (128 bytes)
 Done!
 ```
 
+The script can also come from **STDIN** using the `-` convention (or simply by
+piping when no file is given), which is handy for generated code or one-off
+snippets:
+```
+$ cat script.py | mpytool run -          # explicit '-' = read STDIN
+$ mpytool run - <<< 'print("hi")'        # here-string (single line)
+$ my_codegen | mpytool run               # piped, no file argument
+$ cat boot.py | mpytool run - -- reset -- monitor   # run from STDIN, then chain
+```
+
+For **multi-line** code, feed a here-document straight into `run -` (no `cat`,
+no pipe needed - the here-doc *is* the standard input):
+```
+$ mpytool run - << 'EOF'
+import machine, time
+led = machine.Pin('LED', machine.Pin.OUT)
+for _ in range(3):
+    led.toggle()
+    time.sleep(0.2)
+print('done')
+EOF
+```
+Quote the delimiter (`'EOF'`) so the shell does not expand `$`, backticks or
+`{}` inside the Python code. The closing `EOF` must be on a line of its own.
+
+Because STDIN can be read only once, at most one command per invocation may
+consume it: combining a STDIN `run` with another STDIN `run` or with `repl`
+(which needs the terminal) is rejected up front with a clear error.
+
 ### Edit file on device
 ```
 $ mpytool edit :boot.py              # edit file (uses $VISUAL or $EDITOR)

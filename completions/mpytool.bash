@@ -284,11 +284,12 @@ _mpytool() {
             [[ $nargs -ge 1 && ( -z "$cur" || "--" == "$cur"* ) ]] && COMPREPLY+=("--")
             ;;
         run)
-            # 1 local .py file, -- after it
+            # optional local .py file or '-' for STDIN, -- after it
             if [[ $pos -eq 2 ]]; then
                 COMPREPLY=($(compgen -f -X '!*.py' -- "$cur"))
+                [[ "-" == "$cur"* ]] && COMPREPLY+=("-")
             fi
-            [[ $nargs -ge 1 && ( -z "$cur" || "--" == "$cur"* ) ]] && COMPREPLY+=("--")
+            [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
             ;;
         edit)
             # --editor CMD + 1 remote file, -- after file

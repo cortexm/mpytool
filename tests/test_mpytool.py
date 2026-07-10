@@ -690,10 +690,10 @@ class TestArgsCommand(unittest.TestCase):
         self.assertIn('remote:+:', output)
 
     def test_args_run(self, mock_stdout):
-        """_args run shows exactly-one local_file argument"""
+        """_args run shows an optional local_file argument ('-' = STDIN)"""
         self.tool.process_commands(['_args', 'run'])
         output = mock_stdout.getvalue()
-        self.assertIn('local_file:1:', output)
+        self.assertIn('local_file:?:', output)
 
     def test_args_cp(self, mock_stdout):
         """_args cp shows zero-or-more local_or_remote arguments"""
@@ -734,9 +734,13 @@ class TestRunCommand(unittest.TestCase):
         shutil.rmtree(self.temp_dir)
 
     def test_run_missing_argument(self):
-        """'run' without file -> ParamsError"""
-        with self.assertRaises(ParamsError) as ctx:
-            self.tool.process_commands(['run'])
+        """'run' without file on an interactive terminal -> ParamsError"""
+        # Force interactive stdin (TTY) so no-arg run does not read STDIN
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with patch('mpytool.mpytool._sys.stdin', fake_stdin):
+            with self.assertRaises(ParamsError) as ctx:
+                self.tool.process_commands(['run'])
         self.assertIn('file', str(ctx.exception).lower())
 
     def test_run_file_not_found(self):
@@ -772,6 +776,101 @@ class TestRunCommand(unittest.TestCase):
         self.tool.process_commands(['run', self.test_file, '-t', '0'])
         self.tool._mpy.comm.try_raw_paste.assert_called_once_with(
             b"print('hello')\n", timeout=0)
+
+
+class TestRunStdin(unittest.TestCase):
+    """Tests for run reading code from STDIN ('-' or piped)"""
+
+    def setUp(self):
+        self.tool = MpyTool(Mock(), verbose=None)
+        self.tool._mpy = Mock()
+        self.tool._log = Mock()
+
+    def _fake_stdin(self, data, isatty):
+        """Build a fake sys.stdin whose .buffer.read() yields data"""
+        fake = Mock()
+        fake.isatty.return_value = isatty
+        fake.buffer.read.return_value = data
+        return fake
+
+    def test_run_dash_reads_stdin(self):
+        """'run -' reads code from STDIN regardless of TTY state"""
+        fake = self._fake_stdin(b"print('pipe')\n", isatty=True)
+        with patch('mpytool.mpytool._sys.stdin', fake):
+            self.tool.process_commands(['run', '-'])
+        args, _ = self.tool._mpy.comm.try_raw_paste.call_args
+        self.assertEqual(args[0], b"print('pipe')\n")
+
+    def test_run_no_arg_piped_reads_stdin(self):
+        """'run' with piped STDIN (not a TTY) reads code from STDIN"""
+        fake = self._fake_stdin(b"x = 1\n", isatty=False)
+        with patch('mpytool.mpytool._sys.stdin', fake):
+            self.tool.process_commands(['run'])
+        args, _ = self.tool._mpy.comm.try_raw_paste.call_args
+        self.assertEqual(args[0], b"x = 1\n")
+
+    def test_run_no_arg_tty_errors(self):
+        """'run' with no arg on a TTY (no pipe) -> ParamsError"""
+        fake = self._fake_stdin(b"", isatty=True)
+        with patch('mpytool.mpytool._sys.stdin', fake):
+            with self.assertRaises(ParamsError):
+                self.tool.process_commands(['run'])
+
+    def test_run_dash_fire_and_forget(self):
+        """'run - -t 0' reads STDIN and fires without waiting"""
+        fake = self._fake_stdin(b"boot()\n", isatty=False)
+        with patch('mpytool.mpytool._sys.stdin', fake):
+            self.tool.process_commands(['run', '-', '-t', '0'])
+        self.tool._mpy.comm.try_raw_paste.assert_called_once_with(
+            b"boot()\n", timeout=0)
+
+
+class TestStdinConsumers(unittest.TestCase):
+    """Tests for the STDIN single-consumption pre-flight check"""
+
+    def _count(self, groups):
+        from mpytool.mpytool import _count_stdin_consumers
+        return _count_stdin_consumers(groups)
+
+    def test_run_file_arg_extraction(self):
+        """_run_file_arg finds the file positional past options"""
+        from mpytool.mpytool import _run_file_arg
+        self.assertEqual(_run_file_arg(['-']), '-')
+        self.assertEqual(_run_file_arg(['-t', '0', '-']), '-')
+        self.assertEqual(_run_file_arg(['app.py']), 'app.py')
+        self.assertIsNone(_run_file_arg(['-t', '5']))
+        self.assertIsNone(_run_file_arg([]))
+
+    def test_reads_stdin_predicate(self):
+        """_run_reads_stdin: '-' always, None only when piped"""
+        from mpytool.mpytool import _run_reads_stdin
+        self.assertTrue(_run_reads_stdin('-'))
+        self.assertFalse(_run_reads_stdin('app.py'))
+        with patch('mpytool.mpytool._sys.stdin') as stdin:
+            stdin.isatty.return_value = False
+            self.assertTrue(_run_reads_stdin(None))
+            stdin.isatty.return_value = True
+            self.assertFalse(_run_reads_stdin(None))
+
+    def test_single_consumer_ok(self):
+        """One stdin consumer is allowed"""
+        self.assertEqual(self._count([['run', '-'], ['reset'], ['monitor']]), 1)
+
+    def test_run_and_repl_conflict(self):
+        """run - plus repl are two consumers"""
+        self.assertEqual(self._count([['run', '-'], ['repl']]), 2)
+
+    def test_two_runs_conflict(self):
+        """Two piped runs are two consumers"""
+        self.assertEqual(self._count([['run', '-'], ['run', '-']]), 2)
+
+    def test_file_run_not_consumer(self):
+        """run with a real file does not consume stdin"""
+        self.assertEqual(self._count([['run', 'app.py'], ['repl']]), 1)
+
+    def test_exec_and_monitor_not_consumers(self):
+        """exec and monitor never consume stdin"""
+        self.assertEqual(self._count([['exec', 'x=1'], ['monitor']]), 0)
 
 
 class TestPathCommand(unittest.TestCase):

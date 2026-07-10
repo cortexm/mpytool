@@ -209,6 +209,18 @@ class TestCliErrors(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('only', result.stderr.lower())
 
+    def test_stdin_conflict_run_repl(self):
+        """'run - -- repl' rejected: two STDIN consumers"""
+        result = run_mpytool('-p', '/dev/null', 'run', '-', '--', 'repl')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('stdin', result.stderr.lower())
+
+    def test_stdin_conflict_two_runs(self):
+        """'run - -- run -' rejected: two STDIN consumers"""
+        result = run_mpytool('-p', '/dev/null', 'run', '-', '--', 'run', '-')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('stdin', result.stderr.lower())
+
     def test_no_command(self):
         """No command shows help or error"""
         result = run_mpytool()

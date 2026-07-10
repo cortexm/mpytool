@@ -1094,18 +1094,25 @@ class MpyTool():
         self.mpy.comm.try_raw_paste(
             args.code, timeout=timeout, stream=out)
 
-    @command('run', 'Run local Python file on device.')
-    @argument('file', metavar='local_file', help='local .py file')
+    @command('run', "Run local Python file on device ('-' = STDIN).")
+    @argument('file', nargs='?', metavar='local_file',
+        help="local .py file, or '-' for STDIN (also STDIN if piped)")
     @option('-t', '--timeout', type=float, default=None,
         help='timeout in seconds (0 = fire-and-forget)')
     def _dispatch_run(self, commands, is_last_group):
         args = _make_parser(self._dispatch_run).parse_args(commands)
         commands.clear()
-        if not _os.path.isfile(args.file):
-            raise ParamsError(f"file not found: {args.file}")
-        with open(args.file, 'rb') as f:
-            code = f.read()
-        self.verbose(f"RUN: {args.file} ({len(code)} bytes)", 1)
+        if _run_reads_stdin(args.file):
+            code = _sys.stdin.buffer.read()
+            self.verbose(f"RUN: <stdin> ({len(code)} bytes)", 1)
+        elif args.file is None:
+            raise ParamsError("run needs a file, '-', or piped STDIN")
+        else:
+            if not _os.path.isfile(args.file):
+                raise ParamsError(f"file not found: {args.file}")
+            with open(args.file, 'rb') as f:
+                code = f.read()
+            self.verbose(f"RUN: {args.file} ({len(code)} bytes)", 1)
         timeout = args.timeout
         if timeout == 0:
             self.mpy.comm.try_raw_paste(code, timeout=0)
@@ -1697,6 +1704,54 @@ def _parse_chunk_size(value):
     return num
 
 
+def _run_reads_stdin(file_arg):
+    """True if a `run` with this file argument reads code from STDIN.
+
+    '-' is explicit STDIN; a missing argument (None) reads STDIN only when it
+    is piped (stdin is not an interactive terminal).
+    """
+    if file_arg == '-':
+        return True
+    if file_arg is None:
+        return not _sys.stdin.isatty()
+    return False
+
+
+def _run_file_arg(group_args):
+    """Extract the file positional from a `run` command group's arguments.
+
+    group_args are the tokens after 'run'. Returns the file value ('-', a
+    path, or None if absent). Must track run's value-taking options (-t).
+    """
+    parser = _argparse.ArgumentParser(add_help=False)
+    parser.add_argument('-t', '--timeout')
+    parser.add_argument('file', nargs='?')
+    try:
+        namespace, _ = parser.parse_known_args(group_args)
+    except SystemExit:
+        return None
+    return namespace.file
+
+
+def _count_stdin_consumers(command_groups):
+    """Count command groups that would consume STDIN.
+
+    STDIN is single-consumption: `run -` (or piped `run`) reads it all as a
+    script, and `repl` needs it for the interactive terminal. More than one
+    consumer in a single invocation is a conflict.
+    """
+    count = 0
+    for group in command_groups:
+        if not group:
+            continue
+        if group[0] == 'repl':
+            count += 1
+        elif group[0] == 'run':
+            if _run_reads_stdin(_run_file_arg(group[1:])):
+                count += 1
+    return count
+
+
 def _build_main_parser():
     """Build the main argument parser."""
     _description = _about["Summary"] if _about else None
@@ -1783,6 +1838,12 @@ def main():
         ssl=use_ssl, ssl_verify=ssl_verify, ssl_ca=args.ssl_ca,
         ssl_check_hostname=ssl_check_hostname)
     command_groups = _utils.split_commands(args.commands)
+    # STDIN can be consumed only once - reject multiple consumers up front
+    if _count_stdin_consumers(command_groups) > 1:
+        log.error(
+            "only one command can read from STDIN "
+            "(run - / piped run, repl)")
+        _sys.exit(1)
     try:
         with_progress = args.verbose >= 1
         _run_commands(mpy_tool, command_groups, with_progress=with_progress)
