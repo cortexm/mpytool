@@ -575,7 +575,23 @@ class MpyTool():
             color='cyan', overwrite=True)
 
         self.verbose(
-            "  OTA complete! Use 'mreset' to boot into new firmware.",
+            "  OTA complete! Use 'reset --machine' to boot into new firmware.",
+            1, color='green')
+
+    def cmd_ota_confirm(self):
+        """Mark the running OTA app valid (cancel pending rollback)"""
+        self.verbose("OTA CONFIRM", 1)
+        running = self.mpy.ota_confirm()
+        self.verbose(
+            f"  {running} marked valid - rollback cancelled.",
+            1, color='green')
+
+    def cmd_ota_boot(self, label=None):
+        """Switch the boot partition for the next reset"""
+        self.verbose("OTA BOOT", 1)
+        target = self.mpy.ota_set_boot(label)
+        self.verbose(
+            f"  Boot set to {target}. Use 'reset --machine' to boot it.",
             1, color='green')
 
     def cmd_flash(self):
@@ -702,6 +718,8 @@ class MpyTool():
                 flags.append('enc')
             if p['running']:
                 flags.append('running')
+            if p.get('ota_state'):
+                flags.append(p['ota_state'])
             # Block size column
             block_str = ''
             if p.get('fs_block_size'):
@@ -725,6 +743,18 @@ class MpyTool():
             print(f"\nBoot partition: {info['boot']}")
         if info['next_ota']:
             print(f"Next OTA:       {info['next_ota']}")
+
+        # Warn if the boot-selected OTA app is awaiting confirmation
+        pend = next(
+            (p for p in info['partitions']
+                if p.get('ota_boot') and p.get('ota_state') == 'pending-verify'),
+            None)
+        if pend:
+            self._log.warning(
+                f"{pend['label']} is PENDING_VERIFY - it will roll back on "
+                "next reset unless the running app confirms it via "
+                "esp32.Partition(esp32.Partition.RUNNING)."
+                "mark_app_valid_cancel_rollback()")
 
     def cmd_info(self):
         self.verbose("INFO", 1)
@@ -1261,9 +1291,12 @@ class MpyTool():
             'label', nargs='?', help='partition label (ESP32)')
         flash_erase.add_argument(
             '--full', action='store_true', help='full erase (slow)')
-        flash_ota = flash_sub.add_parser('ota', help='OTA firmware update')
+        flash_ota = flash_sub.add_parser(
+            'ota', help='OTA firmware update / confirm / boot')
         flash_ota.add_argument(
-            'firmware', help='firmware .app-bin file')
+            'args', nargs='+', metavar='arg',
+            help="firmware .app-bin file, or 'confirm' (mark running app "
+                 "valid), or 'boot [label]' (switch boot partition)")
         args = parser.parse_args(commands)
         commands.clear()
         if args.operation == 'read':
@@ -1283,7 +1316,19 @@ class MpyTool():
         elif args.operation == 'erase':
             self.cmd_flash_erase(label=args.label, full=args.full)
         elif args.operation == 'ota':
-            self.cmd_ota(args.firmware)
+            if args.args[0] == 'confirm':
+                if len(args.args) != 1:
+                    raise ParamsError('flash ota confirm (takes no args)')
+                self.cmd_ota_confirm()
+            elif args.args[0] == 'boot':
+                if len(args.args) > 2:
+                    raise ParamsError('flash ota boot [label]')
+                label = args.args[1] if len(args.args) == 2 else None
+                self.cmd_ota_boot(label)
+            else:
+                if len(args.args) != 1:
+                    raise ParamsError('flash ota <firmware>')
+                self.cmd_ota(args.args[0])
         else:
             self.cmd_flash()
 

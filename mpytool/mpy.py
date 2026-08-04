@@ -861,6 +861,11 @@ def _mt_pfind(label):
     }
     # Subtypes that can contain a filesystem (for auto-detection)
     _FS_SUBTYPES = {129, 130, 131}  # fat, spiffs, littlefs
+    # ESP-IDF esp_ota_img_states_t (esp_ota_ops.h)
+    _OTA_STATES = {
+        0x0: 'new', 0x1: 'pending-verify', 0x2: 'valid',
+        0x3: 'invalid', 0x4: 'aborted', 0xffffffff: 'undefined',
+    }
 
     def _detect_fs_from_magic(self, magic):
         """Detect filesystem type and details from magic bytes.
@@ -943,6 +948,57 @@ def _mt_pfind(label):
         except _mpy_comm.CmdError:
             return None
 
+    def _annotate_ota_states(self, partitions):
+        """Annotate app OTA partitions with their rollback state from otadata.
+
+        Each otadata entry (esp_ota_select_entry_t, 32 bytes at the start of a
+        4 KB sector) holds ota_seq, ota_state and a crc over ota_seq. The
+        bootloader boots the entry with the highest valid ota_seq; its slot is
+        (ota_seq - 1) % ota_count. A running app in 'pending-verify' state is
+        rolled back on the next reset unless the firmware confirms it via
+        esp32.Partition(RUNNING).mark_app_valid_cancel_rollback().
+
+        Adds 'ota_state' (str) and 'ota_boot' (bool) keys to matching app
+        partitions in-place. No-op on non-OTA layouts.
+        """
+        otadata = next(
+            (p for p in partitions
+                if p['type'] == 1 and p['subtype_name'] == 'ota'), None)
+        app_ota = [
+            p for p in partitions
+            if p['type'] == 0 and p['subtype_name'].startswith('ota_')]
+        if otadata is None or not app_ota:
+            return
+        result = self._read_partition_magic('otadata', otadata['size'])
+        if not result or len(result[0]) < 60:
+            return
+        raw = result[0]
+        count = len(app_ota)
+        sector = len(raw) // 2
+        best = {}  # slot -> (ota_seq, ota_state)
+        boot_slot, boot_seq = None, 0
+        for i in range(2):
+            off = i * sector
+            seq, = _struct.unpack_from('<I', raw, off)
+            state, = _struct.unpack_from('<I', raw, off + 24)
+            crc, = _struct.unpack_from('<I', raw, off + 28)
+            if seq in (0, 0xffffffff):
+                continue
+            # ESP-IDF crc32_le over the 4 ota_seq bytes: init 0, xorout ~0
+            if (_zlib.crc32(raw[off:off + 4], 0xffffffff) & 0xffffffff) != crc:
+                continue
+            slot = (seq - 1) % count
+            if seq > best.get(slot, (0,))[0]:
+                best[slot] = (seq, state)
+            if seq > boot_seq:
+                boot_seq, boot_slot = seq, slot
+        for p in app_ota:
+            slot = p['subtype'] - 16  # ESP_PARTITION_SUBTYPE_APP_OTA_0 = 0x10
+            if slot in best:
+                p['ota_state'] = self._OTA_STATES.get(
+                    best[slot][1], hex(best[slot][1]))
+            p['ota_boot'] = slot == boot_slot
+
     def partitions(self):
         """Get ESP32 partition information
 
@@ -1024,6 +1080,13 @@ def _mt_pfind(label):
         except _mpy_comm.CmdError:
             next_ota = None
             next_ota_size = None
+
+        # esp32.Partition.find() groups by type (app before data); sort by
+        # flash offset so the layout reads top-to-bottom by address.
+        partitions.sort(key=lambda p: p['offset'])
+
+        # Annotate OTA app partitions with rollback state (from otadata)
+        self._annotate_ota_states(partitions)
 
         return {
             'partitions': partitions,
@@ -1505,6 +1568,83 @@ def _mt_pfind(label):
             'wire_bytes': wire_bytes,
             'compressed': used_compress,
         }
+
+    def ota_confirm(self):
+        """Mark the running app valid, cancelling any pending OTA rollback.
+
+        Wraps esp32.Partition.mark_app_valid_cancel_rollback(). After a fresh
+        OTA boot the image is in 'pending-verify' state and rolls back on the
+        next reset unless confirmed; this makes it the permanent boot image.
+
+        Returns:
+            label of the running partition (str)
+
+        Raises:
+            MpyError: on non-ESP32 devices or if rollback is unsupported
+        """
+        try:
+            self.import_module('esp32')
+        except _mpy_comm.CmdError:
+            raise _mpy_comm.MpyError("OTA not available (ESP32 only)")
+        try:
+            running = self._mpy_comm.exec_eval(
+                "repr(esp32.Partition(esp32.Partition.RUNNING).info()[4])")
+        except _mpy_comm.CmdError:
+            raise _mpy_comm.MpyError("OTA not available (no OTA partitions)")
+        try:
+            self._mpy_comm.exec(
+                "esp32.Partition.mark_app_valid_cancel_rollback()")
+        except _mpy_comm.CmdError as err:
+            raise _mpy_comm.MpyError(
+                "mark_app_valid_cancel_rollback failed "
+                f"(is rollback enabled in firmware?): {err}")
+        return running
+
+    def ota_set_boot(self, label=None):
+        """Switch the boot partition for the next reset.
+
+        Arguments:
+            label: target app partition label (e.g. 'ota_1'); if None, the
+                passive slot from get_next_update() is used (boot the other
+                OTA image, i.e. a manual rollback).
+
+        Returns:
+            label of the partition set as boot (str)
+
+        Raises:
+            MpyError: on non-ESP32 devices, no OTA layout, or unknown label
+        """
+        try:
+            self.import_module('esp32')
+        except _mpy_comm.CmdError:
+            raise _mpy_comm.MpyError("OTA not available (ESP32 only)")
+        if label is None:
+            try:
+                target = self._mpy_comm.exec_eval(
+                    "repr(esp32.Partition(esp32.Partition.RUNNING)"
+                    ".get_next_update().info()[4])")
+                self._mpy_comm.exec(
+                    "esp32.Partition(esp32.Partition.RUNNING)"
+                    ".get_next_update().set_boot()")
+            except _mpy_comm.CmdError:
+                raise _mpy_comm.MpyError(
+                    "OTA not available (no OTA partitions)")
+            return target
+        try:
+            found = self._mpy_comm.exec_eval(
+                "len(esp32.Partition.find(esp32.Partition.TYPE_APP, "
+                f"label={label!r}))")
+        except _mpy_comm.CmdError:
+            raise _mpy_comm.MpyError("OTA not available (ESP32 only)")
+        if not found:
+            raise _mpy_comm.MpyError(f"App partition '{label}' not found")
+        try:
+            self._mpy_comm.exec(
+                "esp32.Partition.find(esp32.Partition.TYPE_APP, "
+                f"label={label!r})[0].set_boot()")
+        except _mpy_comm.CmdError as err:
+            raise _mpy_comm.MpyError(f"set_boot('{label}') failed: {err}")
+        return label
 
     def is_submount(self, mount_point):
         """Check if mount_point would become a virtual submount (link)"""

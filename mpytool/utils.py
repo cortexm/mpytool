@@ -122,7 +122,10 @@ _VIDPID_NAMES = {
     (VID_RASPBERRY_PI, 0x000F): "Raspberry Pi RP2350",
     # Espressif (built-in USB-JTAG-Serial)
     (VID_ESPRESSIF, 0x0002): "Espressif ESP32-S2",
-    (VID_ESPRESSIF, 0x1001): "Espressif ESP32-C3/C6",
+    # 0x1001 is the shared USB-Serial-JTAG block — identical descriptor across
+    # all chips with built-in USB-JTAG (C3/C5/C6/H2/P4/...), so the exact chip
+    # is indistinguishable via USB. Use `ports -i` to identify the real model.
+    (VID_ESPRESSIF, 0x1001): "Espressif ESP32 (USB-JTAG/serial)",
     (VID_ESPRESSIF, 0x1002): "Espressif ESP32-S3",
     # MicroPython official (Pyboard)
     (VID_MICROPYTHON, 0x9800): "Pyboard",

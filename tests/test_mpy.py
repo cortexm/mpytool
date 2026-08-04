@@ -1027,5 +1027,141 @@ class TestCwdAndPathTracking(unittest.TestCase):
         self.assertEqual(self.mpy._custom_syspath, ['/a', '/c'])
 
 
+def _make_otadata(entries, sector=4096):
+    """Build a synthetic otadata partition (2 sectors, erased = 0xff).
+
+    entries: list of (ota_seq, ota_state) for entry 0 and entry 1.
+    """
+    import struct
+    import zlib
+    raw = bytearray(b'\xff' * (sector * 2))
+    for i, (seq, state) in enumerate(entries):
+        off = i * sector
+        struct.pack_into('<I', raw, off, seq)
+        struct.pack_into('<I', raw, off + 24, state)
+        crc = zlib.crc32(struct.pack('<I', seq), 0xffffffff) & 0xffffffff
+        struct.pack_into('<I', raw, off + 28, crc)
+    return bytes(raw)
+
+
+class TestOtaStates(unittest.TestCase):
+    """Tests for _annotate_ota_states (OTA rollback state from otadata)"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+
+    @staticmethod
+    def _parts():
+        return [
+            {'type': 1, 'subtype_name': 'ota', 'subtype': 0,
+                'size': 8192, 'label': 'otadata'},
+            {'type': 0, 'subtype_name': 'ota_0', 'subtype': 16,
+                'label': 'ota_0'},
+            {'type': 0, 'subtype_name': 'ota_1', 'subtype': 17,
+                'label': 'ota_1'},
+        ]
+
+    def _annotate(self, raw):
+        parts = self._parts()
+        with patch.object(
+                self.mpy, '_read_partition_magic', return_value=(raw, 4096)):
+            self.mpy._annotate_ota_states(parts)
+        return parts[1], parts[2]  # ota_0, ota_1
+
+    def test_both_valid_boot_slot0(self):
+        # seq 17 -> slot (17-1)%2=0 (ota_0), seq 16 -> slot 1 (ota_1)
+        ota0, ota1 = self._annotate(_make_otadata([(17, 0x2), (16, 0x2)]))
+        self.assertEqual(ota0['ota_state'], 'valid')
+        self.assertTrue(ota0['ota_boot'])
+        self.assertEqual(ota1['ota_state'], 'valid')
+        self.assertFalse(ota1['ota_boot'])
+
+    def test_pending_verify_on_boot(self):
+        # seq 18 -> slot 1 (ota_1) pending, seq 17 -> slot 0 (ota_0) valid
+        ota0, ota1 = self._annotate(_make_otadata([(18, 0x1), (17, 0x2)]))
+        self.assertEqual(ota0['ota_state'], 'valid')
+        self.assertFalse(ota0['ota_boot'])
+        self.assertEqual(ota1['ota_state'], 'pending-verify')
+        self.assertTrue(ota1['ota_boot'])
+
+    def test_bad_crc_entry_ignored(self):
+        import struct
+        raw = bytearray(_make_otadata([(17, 0x2), (16, 0x2)]))
+        struct.pack_into('<I', raw, 28, 0xdeadbeef)  # corrupt entry 0 crc
+        ota0, ota1 = self._annotate(bytes(raw))
+        # entry 0 (ota_0) rejected -> no state; entry 1 (ota_1) still valid
+        self.assertNotIn('ota_state', ota0)
+        self.assertEqual(ota1['ota_state'], 'valid')
+        self.assertTrue(ota1['ota_boot'])  # only surviving entry -> boot
+
+    def test_no_otadata_is_noop(self):
+        parts = [{'type': 0, 'subtype_name': 'factory', 'subtype': 0,
+                  'label': 'factory'}]
+        self.mpy._annotate_ota_states(parts)  # must not raise
+        self.assertNotIn('ota_state', parts[0])
+
+    def test_erased_otadata_no_state(self):
+        # both entries erased (0xff) -> no valid seq
+        ota0, ota1 = self._annotate(b'\xff' * 8192)
+        self.assertNotIn('ota_state', ota0)
+        self.assertNotIn('ota_state', ota1)
+
+
+class TestOtaConfirmBoot(unittest.TestCase):
+    """Tests for Mpy.ota_confirm and Mpy.ota_set_boot"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+        self.mpy._mpy_comm = Mock()
+        self.mpy._imported = ['esp32']  # skip 'import esp32' exec call
+
+    def _exec_cmds(self):
+        return [c.args[0] for c in self.mpy._mpy_comm.exec.call_args_list]
+
+    def test_ota_confirm_marks_valid(self):
+        self.mpy._mpy_comm.exec_eval.return_value = 'ota_0'
+        result = self.mpy.ota_confirm()
+        self.assertEqual(result, 'ota_0')
+        self.assertTrue(any(
+            'mark_app_valid_cancel_rollback' in c for c in self._exec_cmds()))
+
+    def test_ota_confirm_no_ota_layout(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"error")
+        with self.assertRaises(mpy_comm.MpyError):
+            self.mpy.ota_confirm()
+
+    def test_ota_confirm_mark_fails(self):
+        self.mpy._mpy_comm.exec_eval.return_value = 'ota_0'
+        self.mpy._mpy_comm.exec.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"not supported")
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.ota_confirm()
+        self.assertIn('rollback', str(ctx.exception))
+
+    def test_ota_set_boot_next_slot(self):
+        self.mpy._mpy_comm.exec_eval.return_value = 'ota_1'
+        result = self.mpy.ota_set_boot()
+        self.assertEqual(result, 'ota_1')
+        self.assertTrue(any(
+            'get_next_update().set_boot()' in c for c in self._exec_cmds()))
+
+    def test_ota_set_boot_by_label(self):
+        self.mpy._mpy_comm.exec_eval.return_value = 1  # len(find(...)) == 1
+        result = self.mpy.ota_set_boot('ota_1')
+        self.assertEqual(result, 'ota_1')
+        self.assertTrue(any(
+            "label='ota_1'" in c and 'set_boot' in c
+            for c in self._exec_cmds()))
+
+    def test_ota_set_boot_unknown_label(self):
+        self.mpy._mpy_comm.exec_eval.return_value = 0  # find returns empty
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.ota_set_boot('nope')
+        self.assertIn('not found', str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

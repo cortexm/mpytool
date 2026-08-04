@@ -259,7 +259,7 @@ class TestDetectSerialPortsInfo(unittest.TestCase):
             self._make_port('/dev/ttyACM0', vid=0x303A, pid=0x1001),
         ]
         result = detect_serial_ports_info()
-        self.assertEqual(result[0][1], 'Espressif ESP32-C3/C6')
+        self.assertEqual(result[0][1], 'Espressif ESP32 (USB-JTAG/serial)')
 
     @patch("mpytool.utils._comports")
     def test_serial_number_with_vidpid(self, mock_comports):
