@@ -331,10 +331,23 @@ _mpytool() {
                         )
                         _describe -t subcmds 'flash subcommand' subcmds
                     elif [[ "$flash_subcmd" == "ota" ]]; then
-                        # ota: 1 firmware file, -- after it
+                        # ota: <firmware.bin> | confirm | boot [label]
+                        local ota_action="${words[cmd_start+2]}"
                         if [[ $pos -eq 3 ]]; then
+                            local -a otacmds=(
+                                'confirm:mark running app valid (cancel rollback)'
+                                'boot:switch boot partition'
+                            )
+                            _describe -t otacmds 'ota action' otacmds
                             _files -g "*.bin"
+                            compadd -- '--force'
+                        elif [[ "$ota_action" == "boot" && $pos -eq 4 ]]; then
+                            # partition label (device-specific, no completion)
+                            compadd -- '--'
+                        elif [[ "$ota_action" == "confirm" ]]; then
+                            compadd -- '--'
                         else
+                            compadd -- '--force'
                             compadd -- '--'
                         fi
                     elif [[ $pos -eq 3 && "$flash_subcmd" == "erase" ]]; then
@@ -352,9 +365,9 @@ _mpytool() {
                     # -- after complete subcommand
                     if [[ "$flash_subcmd" == "erase" && $pos -ge 3 ]]; then
                         :  # already handled above
-                    elif [[ "$flash_subcmd" == "ota" && $pos -ge 4 ]]; then
-                        compadd -- '--'
-                    elif [[ "$flash_subcmd" != "erase" && "$flash_subcmd" != "ota" && $pos -ge 5 ]]; then
+                    elif [[ "$flash_subcmd" == "ota" ]]; then
+                        :  # already handled above
+                    elif [[ "$flash_subcmd" != "erase" && $pos -ge 5 ]]; then
                         compadd -- '--'
                     fi
                     ;;

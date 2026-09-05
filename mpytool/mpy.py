@@ -19,6 +19,91 @@ def _escape_path(path: str) -> str:
     return path.replace("\\", "\\\\").replace("'", "\\'")
 
 
+# ESP32 image format (esp_image_format.h / esp_app_desc_t)
+ESP_IMAGE_MAGIC = 0xE9          # first byte of every ESP32 flash image
+ESP_APP_DESC_MAGIC = 0xABCD5432  # esp_app_desc_t.magic_word, at image + 0x20
+ESP_APP_DESC_OFFSET = 0x20
+# esp_chip_id_t -> name (esp_app_format.h, IDF v5.5).
+# Display only: unknown ids fall back to hex, and the chip-match check compares
+# raw ids, so a chip released after this table still works - it just prints as
+# '0x0021'. Chip *revisions* (v1.x vs v3.x) are separate header fields
+# (min/max_chip_rev_full), not distinct chip ids, so they add no entries here.
+ESP_CHIP_IDS = {
+    0x0000: 'ESP32', 0x0002: 'ESP32-S2', 0x0005: 'ESP32-C3',
+    0x0009: 'ESP32-S3', 0x000c: 'ESP32-C2', 0x000d: 'ESP32-C6',
+    0x0010: 'ESP32-H2', 0x0012: 'ESP32-P4', 0x0014: 'ESP32-C61',
+    0x0017: 'ESP32-C5', 0x0019: 'ESP32-H21', 0x001c: 'ESP32-H4',
+}
+
+
+def _cstr(data):
+    """Decode a NUL-terminated char[] field"""
+    return data.split(b'\x00')[0].decode('utf-8', 'replace')
+
+
+def esp_chip_name(chip_id):
+    """Display name for an esp_chip_id_t value ('0x....' if unknown)"""
+    if chip_id is None:
+        return None
+    return ESP_CHIP_IDS.get(chip_id, f'0x{chip_id:04x}')
+
+
+def parse_esp_image(data):
+    """Parse the header of an ESP32 flash image.
+
+    Distinguishes an application image (what OTA requires) from a bootloader
+    or a combined flash image such as MicroPython's firmware.bin, which starts
+    with the bootloader and carries the app further in - writing that to an OTA
+    slot makes set_boot() fail with ESP_ERR_OTA_VALIDATE_FAILED.
+
+    Arguments:
+        data: at least the first ~176 bytes of the image
+
+    Returns:
+        dict with keys:
+            'kind': 'app', 'bootloader', 'empty' or 'invalid'
+            'chip_id', 'chip_name': target chip ('app'/'bootloader' only)
+            'segments': segment count ('app'/'bootloader' only)
+            'idf_ver', 'date', 'time', 'version', 'project': app metadata
+                ('app' only; MicroPython leaves version/project empty)
+            'app_offset': where the app image starts inside a combined
+                image, if one was found ('bootloader' only)
+    """
+    if len(data) < ESP_APP_DESC_OFFSET + 4:
+        return {'kind': 'invalid'}
+    if data[0] != ESP_IMAGE_MAGIC:
+        # Erased flash reads back as 0xff
+        if all(b == 0xff for b in data[:ESP_APP_DESC_OFFSET]):
+            return {'kind': 'empty'}
+        return {'kind': 'invalid'}
+
+    chip_id, = _struct.unpack_from('<H', data, 12)
+    result = {
+        'segments': data[1],
+        'chip_id': chip_id,
+        'chip_name': esp_chip_name(chip_id),
+    }
+    desc_magic, = _struct.unpack_from('<I', data, ESP_APP_DESC_OFFSET)
+    if desc_magic != ESP_APP_DESC_MAGIC:
+        # Valid image, but not an application - almost always a bootloader.
+        # Locate the app inside, so we can report a combined image precisely.
+        result['kind'] = 'bootloader'
+        needle = _struct.pack('<I', ESP_APP_DESC_MAGIC)
+        found = data.find(needle, ESP_APP_DESC_OFFSET + 4)
+        if found >= ESP_APP_DESC_OFFSET:
+            result['app_offset'] = found - ESP_APP_DESC_OFFSET
+        return result
+
+    result['kind'] = 'app'
+    if len(data) >= 0xB0:
+        result['version'] = _cstr(data[0x30:0x50])
+        result['project'] = _cstr(data[0x50:0x70])
+        result['time'] = _cstr(data[0x70:0x80])
+        result['date'] = _cstr(data[0x80:0x90])
+        result['idf_ver'] = _cstr(data[0x90:0xB0])
+    return result
+
+
 class PathNotFound(_mpy_comm.MpyError):
     """File not found"""
     def __init__(self, file_name):
@@ -130,6 +215,15 @@ def _mt_pfind(label):
     if not p:
         p = esp32.Partition.find(esp32.Partition.TYPE_DATA, label=label)
     return p[0] if p else None
+""",
+        'app_image': """
+def _mt_appimg(label, size=256):
+    parts = esp32.Partition.find(esp32.Partition.TYPE_APP, label=label)
+    if not parts:
+        return None
+    buf = bytearray(size)
+    parts[0].readblocks(0, buf)
+    return bytes(buf)
 """}
 
     def __init__(self, conn, log=None, chunk_size=None):
@@ -140,6 +234,7 @@ def _mt_pfind(label):
         self._load_helpers = []
         self._chunk_size = chunk_size  # None = auto-detect on first use
         self._platform = None  # Cached platform name
+        self._chip_id = None  # Cached esp_chip_id_t of the running app
         # Multi-mount state
         self._mounts = []  # [(mid, mount_point, local_path, handler), ...]
         self._next_mid = 0
@@ -170,6 +265,7 @@ def _mt_pfind(label):
         self._load_helpers = []
         self._mpy_comm.reset_state()
         self._platform = None
+        self._chip_id = None
         Mpy._DEFLATE_AVAILABLE = None
 
     def _get_platform(self):
@@ -639,13 +735,20 @@ def _mt_pfind(label):
         }
 
     def memory(self):
-        """Get memory (RAM) information
+        """Get MicroPython GC heap information
+
+        This is the heap available to Python objects, *not* physical RAM. On
+        ESP32 builds with PSRAM the GC heap grows and shrinks on demand, so
+        'total' changes over time: right after a reset it can claim nearly all
+        free PSRAM, and it shrinks again once drivers allocate PSRAM outside
+        the GC heap (e.g. camera framebuffers via heap_caps_malloc). Use
+        esp_ram() for the physical memory regions.
 
         Returns:
             dict with keys:
-                'free': free RAM in bytes
-                'alloc': allocated RAM in bytes
-                'total': total RAM in bytes
+                'free': free bytes in the GC heap
+                'alloc': bytes allocated in the GC heap
+                'total': current GC heap size (free + alloc)
         """
         self.import_module('gc')
         self._mpy_comm.exec("gc.collect()")
@@ -658,6 +761,46 @@ def _mt_pfind(label):
             'alloc': mem_alloc,
             'total': mem_free + mem_alloc,
         }
+
+    # esp_heap_caps.h - passed straight to esp32.idf_heap_info()
+    _MALLOC_CAP_SPIRAM = 1 << 10
+    _MALLOC_CAP_INTERNAL = 1 << 11
+
+    def esp_ram(self):
+        """Get physical RAM usage per region (ESP32 only).
+
+        Unlike memory(), which reports the floating MicroPython GC heap, this
+        reads the ESP-IDF heap regions via esp32.idf_heap_info() and so gives
+        a stable picture of the actual silicon: internal SRAM and, when fitted,
+        external PSRAM. Note the totals cover memory registered with the IDF
+        allocator, so they exclude static .data/.bss and code in IRAM.
+
+        Returns:
+            dict with 'sram' and (if present) 'psram', each a dict of
+            'total', 'free' and 'used' in bytes. Empty dict when unavailable
+            (non-ESP32, or a build without esp32.idf_heap_info).
+        """
+        try:
+            self.import_module('esp32')
+        except _mpy_comm.CmdError:
+            return {}
+        result = {}
+        for name, cap in (
+                ('sram', self._MALLOC_CAP_INTERNAL),
+                ('psram', self._MALLOC_CAP_SPIRAM)):
+            try:
+                # [(total, free, largest_free, min_free), ...] per region
+                regions = self._mpy_comm.exec_eval(
+                    f"esp32.idf_heap_info({cap})")
+            except _mpy_comm.CmdError:
+                return result
+            if not regions:
+                continue  # no such memory fitted (e.g. no PSRAM)
+            total = sum(r[0] for r in regions)
+            free = sum(r[1] for r in regions)
+            result[name] = {
+                'total': total, 'free': free, 'used': total - free}
+        return result
 
     def unique_id(self):
         """Get device unique ID (serial number)
@@ -948,6 +1091,38 @@ def _mt_pfind(label):
         except _mpy_comm.CmdError:
             return None
 
+    def _read_app_image(self, label):
+        """Read the image header from an app partition.
+
+        Returns:
+            parse_esp_image() dict, or None if the read failed
+        """
+        try:
+            self.load_helper('app_image')
+            raw = self._mpy_comm.exec_eval(f"_mt_appimg('{label}')")
+        except _mpy_comm.CmdError:
+            return None
+        if not raw:
+            return None
+        return parse_esp_image(raw)
+
+    def _annotate_app_images(self, partitions):
+        """Annotate app partitions with what their flash content actually is.
+
+        The OTA state in otadata only records the rollback bookkeeping for a
+        slot - it says nothing about the image currently stored there. A slot
+        can read 'valid' while holding a bootloader or garbage (e.g. after
+        writing a combined firmware.bin), so inspect the image header too.
+
+        Adds an 'image' key (parse_esp_image() dict) to each app partition.
+        """
+        for part in partitions:
+            if part['type'] != 0:  # TYPE_APP
+                continue
+            image = self._read_app_image(part['label'])
+            if image is not None:
+                part['image'] = image
+
     def _annotate_ota_states(self, partitions):
         """Annotate app OTA partitions with their rollback state from otadata.
 
@@ -1087,6 +1262,8 @@ def _mt_pfind(label):
 
         # Annotate OTA app partitions with rollback state (from otadata)
         self._annotate_ota_states(partitions)
+        # ...and with what the partitions actually contain
+        self._annotate_app_images(partitions)
 
         return {
             'partitions': partitions,
@@ -1389,6 +1566,10 @@ def _mt_pfind(label):
         self.reset_state()
         if reconnect:
             self._conn.reconnect(timeout=timeout)
+            # Drain the post-reset boot banner / '>>> ' prompt so the next
+            # command's raw REPL entry doesn't desync on a stale '>' (the
+            # 'Raw-paste header mismatch (got 62)' seen on USB-JTAG/Serial).
+            self._mpy_comm.drain_input()
             return True
         return False
 
@@ -1516,13 +1697,18 @@ def _mt_pfind(label):
 
         return wire_bytes, used_compress
 
-    def ota_write(self, data, progress_callback=None, compress=None):
+    def ota_write(
+            self, data, progress_callback=None, compress=None,
+            validate=True, force=False):
         """Write firmware data to next OTA partition
 
         Arguments:
             data: bytes with firmware content (.app-bin)
             progress_callback: optional callback(transferred, total, wire_bytes)
             compress: None=auto-detect, True=force, False=disable
+            validate: check the image header first (set False only if
+                check_ota_image() was already called on this data)
+            force: with validate, warn instead of refusing a bad image
 
         Returns:
             dict with keys:
@@ -1549,6 +1735,11 @@ def _mt_pfind(label):
         part_type, part_subtype, part_offset, part_size, part_label, _ = part_info
         fw_size = len(data)
 
+        # Validate the image before uploading - set_boot() would otherwise
+        # reject it with ESP_ERR_OTA_VALIDATE_FAILED after the whole transfer
+        if validate:
+            self.check_ota_image(data, force=force)
+
         self._mpy_comm.exec("_part = esp32.Partition(esp32.Partition.RUNNING).get_next_update()")
 
         wire_bytes, used_compress = self._write_partition_data(
@@ -1568,6 +1759,88 @@ def _mt_pfind(label):
             'wire_bytes': wire_bytes,
             'compressed': used_compress,
         }
+
+    def running_chip_id(self):
+        """Chip id of the currently running application.
+
+        Taken from the running app's image header rather than a uname() string:
+        the bootloader validates chip_id against the real silicon before
+        booting, so a running image proves its chip_id matches the actual chip.
+        The header layout is also stable across IDF/MicroPython versions, so
+        this works on old firmware too.
+
+        The value is cached - the silicon cannot change during a session.
+
+        Returns:
+            int chip id, or None if it could not be determined
+        """
+        if self._chip_id is not None:
+            return self._chip_id
+        try:
+            label = self._mpy_comm.exec_eval(
+                "repr(esp32.Partition(esp32.Partition.RUNNING).info()[4])")
+        except _mpy_comm.CmdError:
+            return None
+        running = self._read_app_image(label)
+        self._chip_id = running.get('chip_id') if running else None
+        return self._chip_id
+
+    def check_ota_image(self, data, force=False):
+        """Validate firmware before an OTA upload.
+
+        set_boot() runs esp_image_verify() on the partition and refuses
+        anything that is not a valid app for this chip, but only after the
+        whole image has been transferred. Checking the header up front turns a
+        minutes-long upload followed by ESP_ERR_OTA_VALIDATE_FAILED into an
+        immediate, actionable error.
+
+        Arguments:
+            data: firmware image bytes
+            force: report problems as warnings and continue instead of raising
+
+        Raises:
+            MpyError: if the data is not an application image for this chip
+                (unless force is set)
+        """
+        image = parse_esp_image(data)
+        kind = image['kind']
+        problem = None
+        if kind == 'bootloader':
+            problem = ("Not an application image - it starts with a "
+                       "bootloader. This looks like a combined flash image "
+                       "(bootloader + partition table + app)")
+            if 'app_offset' in image:
+                problem += f", with the app at offset 0x{image['app_offset']:X}"
+            problem += (". OTA needs the app-only image (e.g. micropython.bin,"
+                        " not firmware.bin); flash a combined image with "
+                        "esptool.")
+        elif kind == 'empty':
+            problem = "Firmware image is empty (all 0xff)"
+        elif kind != 'app':
+            problem = "Not a valid ESP32 image (bad magic byte, expected 0xE9)"
+        else:
+            # A wrong-chip image uploads fine but fails verification just the
+            # same, so compare with the chip the device is actually running.
+            device_chip = self.running_chip_id()
+            if device_chip is not None and device_chip != image['chip_id']:
+                dev_name = esp_chip_name(device_chip)
+                problem = (f"Firmware is for {image['chip_name']}, but the "
+                           f"device runs {dev_name}")
+            elif image['chip_id'] not in ESP_CHIP_IDS:
+                # Matching (or unverifiable) but unrecognised: not an error,
+                # just a sign this mpytool predates the chip.
+                self._log.warning(
+                    "Unknown chip id 0x%04x - this mpytool does not know it "
+                    "yet. Consider updating mpytool, or report it at "
+                    "https://github.com/cortexm/mpytool/issues",
+                    image['chip_id'])
+
+        if not problem:
+            return
+        if force:
+            self._log.warning("%s (writing anyway: --force)", problem)
+            return
+        raise _mpy_comm.MpyError(f"{problem} Use --force to write it anyway.")
 
     def ota_confirm(self):
         """Mark the running app valid, cancelling any pending OTA rollback.

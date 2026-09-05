@@ -181,6 +181,33 @@ class MpyComm():
         self._repl_mode = None
         self._raw_paste_supported = None
 
+    def drain_input(self, first_wait=1.0, idle=0.3, max_wait=5.0):
+        """Consume pending device output until the input goes idle.
+
+        After a hard reset the device re-emits its boot banner and one or
+        more '>>> ' prompts (plus any boot.py/main.py output). Left in the
+        buffer, a stale '>' desyncs the next raw-paste header read - seen as
+        'Raw-paste header mismatch (got 62)', notably on USB-JTAG/Serial
+        devices where boot output arrives with variable delay after reconnect.
+
+        Waits up to first_wait for output to begin (returns early if the
+        device is already quiet), then reads until idle for one full idle
+        period, bounded by max_wait.
+
+        Arguments:
+            first_wait: max time to wait for the first byte
+            idle: quiet gap that counts as 'drained'
+            max_wait: overall cap (e.g. for a boot loop that never settles)
+        """
+        if self._conn.read(timeout=first_wait) is None:
+            return  # device already quiet, nothing to drain
+        deadline = _time.time() + max_wait
+        while _time.time() < deadline:
+            if self._conn.read(timeout=idle) is None:
+                break
+        self._conn.flush()  # drop anything buffered by read_until helpers
+        self._repl_mode = None
+
     def monitor(self, stream=False, follow=False):
         """Monitor device output in normal REPL mode.
 

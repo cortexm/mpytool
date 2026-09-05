@@ -522,7 +522,7 @@ class MpyTool():
         self.conn.discard_output()
         self._log.info('Exiting..')
 
-    def cmd_ota(self, firmware_path):
+    def cmd_ota(self, firmware_path, force=False):
         """OTA firmware update from local .app-bin file"""
         self.verbose("OTA UPDATE", 1)
         if not _os.path.isfile(firmware_path):
@@ -532,13 +532,33 @@ class MpyTool():
             firmware = f.read()
 
         fw_size = len(firmware)
-        self.verbose(f"  Firmware: {_utils.format_size(fw_size)}", 1)
+        # Describe the image first (pure header parse), so the summary shows
+        # even when validation rejects it below
+        image = _mpytool.parse_esp_image(firmware)
+        summary = [_utils.format_size(fw_size)]
+        if image.get('chip_name'):
+            summary.append(image['chip_name'])
+        if image.get('date'):
+            built = f"built {image['date']} {image.get('time', '')}".strip()
+            if image.get('idf_ver'):
+                built += f" (IDF {image['idf_ver']})"
+            summary.append(built)
+        self.verbose(f"  Image: {', '.join(summary)}", 1)
+        # Validate before announcing any writing, so a rejected image never
+        # looks like it got partly transferred
+        self.mpy.check_ota_image(firmware, force=force)
         info = self.mpy.partitions()
         if not info['next_ota']:
             raise _mpytool.MpyError("OTA not available (no OTA partitions)")
 
         ota_size = _utils.format_size(info['next_ota_size'])
-        self.verbose(f"  Target: {info['next_ota']} ({ota_size})", 1)
+        target = [f"{info['next_ota']} ({ota_size})"]
+        # Device side, mirroring the Image line above - the two chip names
+        # must match, which is exactly what check_ota_image() enforces
+        chip = _mpytool.esp_chip_name(self.mpy.running_chip_id())
+        if chip:
+            target.append(chip)
+        self.verbose(f"  Target: {', '.join(target)}", 1)
         use_compress = self.mpy.detect_deflate()
         chunk_size = self.mpy.chunk_size
         if chunk_size >= 1024:
@@ -563,7 +583,7 @@ class MpyTool():
                 self.verbose(line, color='cyan', end='', overwrite=True)
 
         result = self.mpy.ota_write(
-            firmware, progress_callback, self._compress)
+            firmware, progress_callback, self._compress, validate=False)
         elapsed = _time.time() - start_time
         speed = fw_size / elapsed / 1024 if elapsed > 0 else 0
         wire = result['wire_bytes']
@@ -703,14 +723,26 @@ class MpyTool():
                 "  filesystem will be recreated on next boot",
                 1, color='yellow')
 
+    @staticmethod
+    def _format_image(image):
+        """Short label for the image an app partition holds"""
+        kind = image['kind']
+        if kind == 'app':
+            return f"app {image.get('chip_name', '')}".strip()
+        if kind == 'bootloader':
+            return 'BOOTLOADER!'
+        if kind == 'empty':
+            return 'empty'
+        return 'INVALID!'
+
     def _cmd_flash_esp32(self):
         """List ESP32 partitions"""
         info = self.mpy.partitions()
         print(
             f"{'Label':<12} {'Type':<8} {'Subtype':<10} "
             f"{'Address':>10} {'Size':>10} "
-            f"{'Block':>8} {'Actual FS':<12} {'Flags'}")
-        print("-" * 90)
+            f"{'Block':>8} {'Content':<14} {'Flags'}")
+        print("-" * 92)
 
         for p in info['partitions']:
             flags = []
@@ -718,13 +750,15 @@ class MpyTool():
                 flags.append('enc')
             if p['running']:
                 flags.append('running')
+            # Prefix the otadata state: it is the rollback bookkeeping for the
+            # slot, not a verdict on the image stored in it (see Content).
             if p.get('ota_state'):
-                flags.append(p['ota_state'])
+                flags.append(f"ota:{p['ota_state']}")
             # Block size column
             block_str = ''
             if p.get('fs_block_size'):
                 block_str = _utils.format_size(p['fs_block_size'])
-            # Filesystem column
+            # Content column: filesystem for data, image kind for app
             fs_info = ''
             if p.get('filesystem'):
                 fs_info = p['filesystem']
@@ -732,12 +766,14 @@ class MpyTool():
                 if p.get('fs_cluster_size'):
                     cls = _utils.format_size(p['fs_cluster_size'])
                     fs_info += f" ({cls})"
+            elif p.get('image'):
+                fs_info = self._format_image(p['image'])
             sz = _utils.format_size(p['size'])
             print(
                 f"{p['label']:<12} {p['type_name']:<8} "
                 f"{p['subtype_name']:<10} "
                 f"{p['offset']:>#10x} {sz:>10} "
-                f"{block_str:>8} {fs_info:<12} {', '.join(flags)}")
+                f"{block_str:>8} {fs_info:<14} {', '.join(flags)}")
 
         if info['boot']:
             print(f"\nBoot partition: {info['boot']}")
@@ -755,6 +791,19 @@ class MpyTool():
                 "next reset unless the running app confirms it via "
                 "esp32.Partition(esp32.Partition.RUNNING)."
                 "mark_app_valid_cancel_rollback()")
+
+        # Warn about app slots not holding a usable app. The otadata state
+        # says nothing about the stored image, so a slot can read ota:valid
+        # while containing a bootloader (a combined firmware.bin was written).
+        for p in info['partitions']:
+            image = p.get('image')
+            if not image or image['kind'] in ('app', 'empty'):
+                continue
+            what = ("a bootloader (combined flash image?)"
+                    if image['kind'] == 'bootloader' else "not a valid image")
+            self._log.warning(
+                f"{p['label']} contains {what} - it cannot be booted. "
+                "OTA needs the app-only image (e.g. micropython.bin).")
 
     def cmd_info(self):
         self.verbose("INFO", 1)
@@ -777,6 +826,16 @@ class MpyTool():
             print(f"Serial:      {uid}")
         for iface, mac in self.mpy.mac_addresses():
             print(f"MAC {iface + ':':<8} {mac}")
+        # Physical RAM first (stable), then the GC heap that floats within it
+        ram_info = self.mpy.esp_ram()
+        for name, label in (('sram', 'SRAM'), ('psram', 'PSRAM')):
+            ram = ram_info.get(name)
+            if not ram or ram['total'] <= 0:
+                continue
+            pct = ram['used'] / ram['total'] * 100
+            used = _utils.format_size(ram['used'])
+            tot = _utils.format_size(ram['total'])
+            print(f"{label + ':':<12} {used} / {tot} ({pct:.2f}%)")
         mem = self.mpy.memory()
         if mem['total'] > 0:
             mem_pct = mem['alloc'] / mem['total'] * 100
@@ -784,7 +843,7 @@ class MpyTool():
             mem_pct = 0
         alloc = _utils.format_size(mem['alloc'])
         total = _utils.format_size(mem['total'])
-        print(f"Memory:      {alloc} / {total} ({mem_pct:.2f}%)")
+        print(f"GC heap:     {alloc} / {total} ({mem_pct:.2f}%)")
         for fs in self.mpy.filesystems():
             if fs['mount'] == '/':
                 label = "Flash:"
@@ -1297,6 +1356,9 @@ class MpyTool():
             'args', nargs='+', metavar='arg',
             help="firmware .app-bin file, or 'confirm' (mark running app "
                  "valid), or 'boot [label]' (switch boot partition)")
+        flash_ota.add_argument(
+            '--force', action='store_true',
+            help='write even if the image fails validation')
         args = parser.parse_args(commands)
         commands.clear()
         if args.operation == 'read':
@@ -1328,7 +1390,7 @@ class MpyTool():
             else:
                 if len(args.args) != 1:
                     raise ParamsError('flash ota <firmware>')
-                self.cmd_ota(args.args[0])
+                self.cmd_ota(args.args[0], force=args.force)
         else:
             self.cmd_flash()
 

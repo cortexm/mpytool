@@ -542,9 +542,24 @@ Version:     3.4.0; MicroPython v1.27.0 on 2025-12-09
 Impl:        micropython
 Machine:     Raspberry Pi Pico with RP2040
 Serial:      e660123456789abc
-Memory:      36.4 KB / 240 KB (15.15%)
+GC heap:     36.4 KB / 240 KB (15.15%)
 Flash:       120 KB / 1.38 MB (8.52%)
 ```
+
+On ESP32 the physical memory regions are listed too (from the ESP-IDF
+allocator), which stays stable regardless of what the GC heap is doing:
+
+```
+SRAM:        412 KB / 640 KB (64.38%)
+PSRAM:       12.0 MB / 32.0 MB (37.50%)
+GC heap:     209 KB / 20.0 MB (1.02%)
+```
+
+`GC heap` is the heap MicroPython uses for Python objects - **not** the amount
+of RAM in the chip. On builds with PSRAM it grows and shrinks on demand, so its
+total changes over time: right after a reset it can claim nearly all free PSRAM,
+and it shrinks once drivers allocate PSRAM outside the GC heap (e.g. camera
+framebuffers). Use the `SRAM` / `PSRAM` lines to judge actual memory pressure.
 
 On devices with WiFi or Ethernet, MAC addresses are also shown:
 ```
@@ -562,15 +577,18 @@ $ mpytool flash erase                 # quick erase (reset filesystem)
 $ mpytool flash erase --full          # full erase
 
 # ESP32 - partitions (by label)
-$ mpytool flash                       # list all partitions with filesystem info
-Label        Type     Subtype       Address       Size    Block Actual FS     Flags
-------------------------------------------------------------------------------------------
-factory      app      factory       0x10000      1.94M                        running
-nvs          data     nvs            0x9000      24.0K
-vfs          data     littlefs     0x200000      2.00M     4 KB littlefs2
+$ mpytool flash                       # list all partitions, sorted by address
+Label        Type     Subtype       Address       Size    Block Content        Flags
+--------------------------------------------------------------------------------------------
+nvs          data     nvs            0x9000      16.0K
+otadata      data     ota            0xd000      8.00K
+phy_init     data     phy            0xf000      4.00K
+ota_0        app      ota_0         0x10000      2.50M          app ESP32-P4   running, ota:valid
+ota_1        app      ota_1        0x290000      2.50M          app ESP32-P4   ota:valid
+vfs          data     fat          0x510000      10.9M    4.00K littlefs2
 
-Boot partition: factory
-Next OTA:       (none)
+Boot partition: ota_0
+Next OTA:       ota_1
 
 $ mpytool flash read vfs backup.bin        # backup partition to file
 $ mpytool flash write nvs nvs_backup.bin   # restore partition from file
@@ -578,11 +596,39 @@ $ mpytool flash erase vfs                  # quick erase partition
 $ mpytool flash erase vfs --full           # full erase partition
 ```
 
+`Content` shows what a partition actually holds - the detected filesystem for
+data partitions, the image type for app partitions (`app <CHIP>`, or
+`BOOTLOADER!` / `INVALID!` / `empty`). The `ota:` flags come from the `otadata`
+partition and describe the **rollback bookkeeping** of a slot, not the image
+stored in it: a slot can read `ota:valid` while holding an unbootable image.
+
 ### OTA firmware update (ESP32)
+
+OTA needs an **app-only** image (`micropython.bin`), not the combined
+`firmware.bin` (bootloader + partition table + app) that `esptool` writes.
+mpytool checks the image header before uploading, so a wrong file is rejected
+immediately instead of failing with `ESP_ERR_OTA_VALIDATE_FAILED` after the
+whole transfer. It also refuses an image built for a different chip.
+
 ```
-$ mpytool flash ota firmware.app-bin                    # flash to next OTA partition
-$ mpytool flash ota firmware.app-bin -- reset --machine          # flash and reboot
-$ mpytool flash ota firmware.app-bin -- reset --machine -t 30    # flash and reboot with 30s timeout
+$ mpytool flash ota micropython.bin                     # write to next OTA partition
+$ mpytool flash ota micropython.bin -- reset --machine  # write and reboot
+$ mpytool flash ota micropython.bin -- reset --machine -t 30   # ... with 30s timeout
+$ mpytool flash ota micropython.bin --force             # write despite failed validation
+
+$ mpytool flash ota confirm            # mark running app valid (cancel rollback)
+$ mpytool flash ota boot               # boot the other slot (manual rollback)
+$ mpytool flash ota boot ota_1         # boot a specific app partition
+```
+
+If the firmware enables rollback, a freshly booted OTA image stays in
+`pending-verify` and reverts on the next reset until it is confirmed - either by
+the app itself (`esp32.Partition(esp32.Partition.RUNNING).mark_app_valid_cancel_rollback()`)
+or from the host:
+
+```
+$ mpytool flash ota micropython.bin -- reset --machine
+$ mpytool flash ota confirm
 ```
 
 ### Multiple commands separated by `--`

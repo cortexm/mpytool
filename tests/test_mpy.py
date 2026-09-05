@@ -3,7 +3,8 @@
 import base64
 import unittest
 from unittest.mock import Mock, patch
-from mpytool.mpy import _escape_path, Mpy
+from mpytool.mpy import (
+    _escape_path, Mpy, parse_esp_image, esp_chip_name)
 import mpytool.mpy_comm as mpy_comm
 
 
@@ -1106,6 +1107,263 @@ class TestOtaStates(unittest.TestCase):
         ota0, ota1 = self._annotate(b'\xff' * 8192)
         self.assertNotIn('ota_state', ota0)
         self.assertNotIn('ota_state', ota1)
+
+
+def _make_esp_image(chip_id=0x0012, segments=8, app_desc=True):
+    """Build a synthetic ESP32 image header (app or bootloader)"""
+    import struct
+    b = bytearray(0xB0)
+    b[0] = 0xE9
+    b[1] = segments
+    struct.pack_into('<H', b, 12, chip_id)
+    if app_desc:
+        struct.pack_into('<I', b, 0x20, 0xABCD5432)
+        b[0x70:0x78] = b'08:15:57'
+        b[0x80:0x8B] = b'Aug  7 2026'
+        b[0x90:0x96] = b'v5.5.5'
+    return bytes(b)
+
+
+class TestParseEspImage(unittest.TestCase):
+    """Tests for parse_esp_image (ESP32 image header parsing)"""
+
+    def test_app_image(self):
+        img = parse_esp_image(_make_esp_image())
+        self.assertEqual(img['kind'], 'app')
+        self.assertEqual(img['chip_name'], 'ESP32-P4')
+        self.assertEqual(img['segments'], 8)
+        self.assertEqual(img['idf_ver'], 'v5.5.5')
+        self.assertEqual(img['date'], 'Aug  7 2026')
+
+    def test_bootloader_image(self):
+        img = parse_esp_image(_make_esp_image(segments=3, app_desc=False))
+        self.assertEqual(img['kind'], 'bootloader')
+        self.assertNotIn('app_offset', img)
+
+    def test_combined_image_reports_app_offset(self):
+        # bootloader followed by the app image, as in firmware.bin
+        boot = _make_esp_image(segments=3, app_desc=False)
+        combined = boot + b'\x00' * (0xE000 - len(boot)) + _make_esp_image()
+        img = parse_esp_image(combined)
+        self.assertEqual(img['kind'], 'bootloader')
+        self.assertEqual(img['app_offset'], 0xE000)
+
+    def test_empty_image(self):
+        self.assertEqual(parse_esp_image(b'\xff' * 256)['kind'], 'empty')
+
+    def test_invalid_image(self):
+        self.assertEqual(parse_esp_image(b'not an image' * 20)['kind'],
+                         'invalid')
+
+    def test_too_short(self):
+        self.assertEqual(parse_esp_image(b'\xe9\x08')['kind'], 'invalid')
+
+    def test_unknown_chip_id_falls_back_to_hex(self):
+        # a chip released after our table must still parse
+        img = parse_esp_image(_make_esp_image(chip_id=0x0099))
+        self.assertEqual(img['kind'], 'app')
+        self.assertEqual(img['chip_name'], '0x0099')
+
+
+class TestEspRam(unittest.TestCase):
+    """Tests for Mpy.esp_ram (physical RAM via esp32.idf_heap_info)"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+        self.mpy._mpy_comm = Mock()
+        self.mpy._imported = ['esp32']
+
+    def test_sums_regions_per_capability(self):
+        # (total, free, largest_free, min_free) per region
+        self.mpy._mpy_comm.exec_eval.side_effect = [
+            [(400_000, 100_000, 0, 0), (240_000, 40_000, 0, 0)],  # internal
+            [(32 * 1024 * 1024, 20 * 1024 * 1024, 0, 0)],         # spiram
+        ]
+        ram = self.mpy.esp_ram()
+        self.assertEqual(ram['sram']['total'], 640_000)
+        self.assertEqual(ram['sram']['free'], 140_000)
+        self.assertEqual(ram['sram']['used'], 500_000)
+        self.assertEqual(ram['psram']['total'], 32 * 1024 * 1024)
+        self.assertEqual(ram['psram']['used'], 12 * 1024 * 1024)
+
+    def test_no_psram_omits_key(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = [
+            [(400_000, 100_000, 0, 0)],  # internal
+            [],                          # no PSRAM fitted
+        ]
+        ram = self.mpy.esp_ram()
+        self.assertIn('sram', ram)
+        self.assertNotIn('psram', ram)
+
+    def test_uses_correct_capabilities(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = [[], []]
+        self.mpy.esp_ram()
+        cmds = [c.args[0] for c in self.mpy._mpy_comm.exec_eval.call_args_list]
+        self.assertIn('esp32.idf_heap_info(2048)', cmds)  # MALLOC_CAP_INTERNAL
+        self.assertIn('esp32.idf_heap_info(1024)', cmds)  # MALLOC_CAP_SPIRAM
+
+    def test_returns_empty_without_esp32(self):
+        self.mpy._imported = []
+        self.mpy._mpy_comm.exec.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"no module")
+        self.assertEqual(self.mpy.esp_ram(), {})
+
+    def test_returns_partial_when_helper_missing(self):
+        # older build without idf_heap_info -> no crash, no data
+        self.mpy._mpy_comm.exec_eval.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"error")
+        self.assertEqual(self.mpy.esp_ram(), {})
+
+
+class TestRunningChipId(unittest.TestCase):
+    """Tests for Mpy.running_chip_id (device chip detection + caching)"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+        self.mpy._mpy_comm = Mock()
+        self.mpy._imported = ['esp32']
+
+    def test_reads_chip_id_from_running_image(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = [
+            'ota_0', _make_esp_image(chip_id=0x0012)]
+        self.assertEqual(self.mpy.running_chip_id(), 0x0012)
+
+    def test_result_is_cached(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = [
+            'ota_0', _make_esp_image(chip_id=0x0012)]
+        self.mpy.running_chip_id()
+        calls = self.mpy._mpy_comm.exec_eval.call_count
+        self.assertEqual(self.mpy.running_chip_id(), 0x0012)
+        self.assertEqual(self.mpy._mpy_comm.exec_eval.call_count, calls)
+
+    def test_cache_cleared_on_reset_state(self):
+        self.mpy._chip_id = 0x0012
+        self.mpy.reset_state()
+        self.assertIsNone(self.mpy._chip_id)
+
+    def test_returns_none_when_unavailable(self):
+        self.mpy._mpy_comm.exec_eval.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"error")
+        self.assertIsNone(self.mpy.running_chip_id())
+
+
+class TestEspChipName(unittest.TestCase):
+    """Tests for esp_chip_name helper"""
+
+    def test_known_chip(self):
+        self.assertEqual(esp_chip_name(0x0012), 'ESP32-P4')
+        self.assertEqual(esp_chip_name(0x0000), 'ESP32')
+
+    def test_unknown_chip_falls_back_to_hex(self):
+        self.assertEqual(esp_chip_name(0x0099), '0x0099')
+
+    def test_none(self):
+        self.assertIsNone(esp_chip_name(None))
+
+
+class TestCheckOtaImage(unittest.TestCase):
+    """Tests for Mpy.check_ota_image (OTA pre-flight validation)"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.mpy = Mpy(self.mock_conn)
+        self.mpy._mpy_comm = Mock()
+        self.mpy._imported = ['esp32']
+
+    def _device_chip(self, chip_id):
+        """Make the running partition report an app image for chip_id"""
+        self.mpy._mpy_comm.exec_eval.side_effect = [
+            'ota_0',                            # running label
+            _make_esp_image(chip_id=chip_id),   # _mt_appimg() bytes
+        ]
+
+    def test_rejects_combined_image(self):
+        boot = _make_esp_image(segments=3, app_desc=False)
+        combined = boot + b'\x00' * (0xE000 - len(boot)) + _make_esp_image()
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.check_ota_image(combined)
+        msg = str(ctx.exception)
+        self.assertIn('combined flash image', msg)
+        self.assertIn('0xE000', msg)
+        self.assertIn('micropython.bin', msg)
+
+    def test_rejects_empty(self):
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.check_ota_image(b'\xff' * 256)
+        self.assertIn('empty', str(ctx.exception))
+
+    def test_rejects_garbage(self):
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.check_ota_image(b'nope' * 100)
+        self.assertIn('0xE9', str(ctx.exception))
+
+    def test_accepts_matching_app(self):
+        self._device_chip(0x0012)
+        self.mpy.check_ota_image(_make_esp_image(chip_id=0x0012))  # no raise
+
+    def test_rejects_chip_mismatch(self):
+        self._device_chip(0x000d)  # device runs esp32c6
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.check_ota_image(_make_esp_image(chip_id=0x0012))
+        msg = str(ctx.exception)
+        self.assertIn('ESP32-P4', msg)
+        self.assertIn('ESP32-C6', msg)
+
+    def test_passes_when_device_chip_unknown(self):
+        # cannot read the running image -> do not block the update
+        self.mpy._mpy_comm.exec_eval.side_effect = mpy_comm.CmdError(
+            "cmd", b"", b"error")
+        self.mpy.check_ota_image(_make_esp_image())  # no raise
+
+    def test_error_mentions_force(self):
+        with self.assertRaises(mpy_comm.MpyError) as ctx:
+            self.mpy.check_ota_image(b'\xff' * 256)
+        self.assertIn('--force', str(ctx.exception))
+
+    def test_force_downgrades_to_warning(self):
+        self.mpy._log = Mock()
+        self.mpy.check_ota_image(b'\xff' * 256, force=True)  # no raise
+        self.mpy._log.warning.assert_called_once()
+        self.assertIn('--force', self.mpy._log.warning.call_args.args[0])
+
+    def test_force_allows_chip_mismatch(self):
+        self.mpy._log = Mock()
+        self._device_chip(0x000d)
+        self.mpy.check_ota_image(_make_esp_image(chip_id=0x0012), force=True)
+        self.mpy._log.warning.assert_called_once()
+
+    def test_unknown_chip_id_warns_but_passes(self):
+        self.mpy._log = Mock()
+        self._device_chip(0x0099)  # device and image agree, but unrecognised
+        self.mpy.check_ota_image(_make_esp_image(chip_id=0x0099))  # no raise
+        self.mpy._log.warning.assert_called_once()
+        msg = self.mpy._log.warning.call_args.args[0]
+        self.assertIn('Unknown chip id', msg)
+
+
+class TestDrainInput(unittest.TestCase):
+    """Tests for MpyComm.drain_input (post-reset boot-output drain)"""
+
+    def setUp(self):
+        self.mock_conn = Mock()
+        self.comm = mpy_comm.MpyComm(self.mock_conn)
+
+    def test_returns_early_when_quiet(self):
+        # first read returns None -> device already quiet, nothing to drain
+        self.mock_conn.read.return_value = None
+        self.comm.drain_input(first_wait=0.01, idle=0.01, max_wait=0.1)
+        self.assertEqual(self.mock_conn.read.call_count, 1)
+        self.mock_conn.flush.assert_not_called()
+
+    def test_drains_until_idle(self):
+        # active for two reads, then a quiet gap ends the drain
+        self.mock_conn.read.side_effect = [b'boot banner', b'>>> ', None]
+        self.comm.drain_input(first_wait=0.01, idle=0.01, max_wait=1.0)
+        self.assertEqual(self.mock_conn.read.call_count, 3)
+        self.mock_conn.flush.assert_called_once()
+        self.assertIsNone(self.comm._repl_mode)
 
 
 class TestOtaConfirmBoot(unittest.TestCase):

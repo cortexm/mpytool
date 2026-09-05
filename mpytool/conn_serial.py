@@ -5,6 +5,17 @@ import serial as _serial
 import mpytool.conn as _conn
 import mpytool.utils as _utils
 
+try:
+    import termios as _termios
+    # pyserial can leak a bare termios.error from _reconfigure_port() when a
+    # USB-CDC node lingers after the device re-enumerated under a different
+    # name (e.g. /dev/cu.usbmodem12 -> ...13 after a machine reset on macOS).
+    # It is not a SerialException nor an OSError, so catch it explicitly.
+    _PORT_OPEN_ERRORS = (
+        _serial.serialutil.SerialException, OSError, _termios.error)
+except ImportError:  # Windows has no termios
+    _PORT_OPEN_ERRORS = (_serial.serialutil.SerialException, OSError)
+
 
 class ConnSerial(_conn.Conn):
     RECONNECT_TIMEOUT = 10  # seconds
@@ -15,7 +26,7 @@ class ConnSerial(_conn.Conn):
         self._port_info = _utils.get_port_info(serial_config.get('port', ''))
         try:
             self._serial = _serial.Serial(**serial_config)
-        except _serial.serialutil.SerialException as err:
+        except _PORT_OPEN_ERRORS as err:
             self._serial = None
             raise _conn.ConnError(
                 f"Error opening serial port {serial_config['port']}") from err
@@ -159,11 +170,11 @@ class ConnSerial(_conn.Conn):
                 # Verify connection is stable
                 _ = self._serial.in_waiting
                 return True
-            except (_serial.serialutil.SerialException, OSError):
+            except _PORT_OPEN_ERRORS:
                 if self._serial:
                     try:
                         self._serial.close()
-                    except (OSError, _serial.serialutil.SerialException):
+                    except _PORT_OPEN_ERRORS:
                         pass
                     self._serial = None
                 _time.sleep(0.1)

@@ -325,10 +325,18 @@ _mpytool() {
             if [[ $pos -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "read write erase ota" -- "$cur"))
             elif [[ "$flash_subcmd" == "ota" ]]; then
-                # ota: 1 firmware file, -- after it
+                # ota: <firmware.bin> | confirm | boot [label]
+                local ota_action="${COMP_WORDS[cmd_start+2]}"
                 if [[ $pos -eq 3 ]]; then
-                    COMPREPLY=($(compgen -f -X '!*.bin' -- "$cur"))
+                    COMPREPLY=($(compgen -W "confirm boot --force" -- "$cur"))
+                    COMPREPLY+=($(compgen -f -X '!*.bin' -- "$cur"))
+                elif [[ "$ota_action" == "boot" && $pos -eq 4 ]]; then
+                    # partition label (device-specific, no completion)
+                    [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
+                elif [[ "$ota_action" == "confirm" ]]; then
+                    [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
                 else
+                    COMPREPLY=($(compgen -W "--force" -- "$cur"))
                     [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
                 fi
             elif [[ $pos -eq 3 && "$flash_subcmd" == "erase" ]]; then
@@ -344,9 +352,9 @@ _mpytool() {
                 [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
             fi
             # -- after complete subcommand
-            if [[ "$flash_subcmd" == "ota" && $pos -ge 4 ]]; then
-                [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
-            elif [[ "$flash_subcmd" != "erase" && "$flash_subcmd" != "ota" && $pos -ge 5 ]]; then
+            if [[ "$flash_subcmd" == "ota" ]]; then
+                :  # already handled above
+            elif [[ "$flash_subcmd" != "erase" && $pos -ge 5 ]]; then
                 [[ -z "$cur" || "--" == "$cur"* ]] && COMPREPLY+=("--")
             fi
             ;;
