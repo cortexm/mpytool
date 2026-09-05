@@ -51,6 +51,7 @@ class ConnSocket(_conn.Conn):
             log.info("connected")
 
     def close(self):
+        super().close()
         if self._socket:
             self._socket.close()
             self._socket = None

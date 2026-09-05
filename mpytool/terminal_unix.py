@@ -1,8 +1,8 @@
-"""MicroPython tool: Unix terminal (tty/termios/select)"""
+"""MicroPython tool: Unix terminal (tty/termios/selectors)"""
 
 import os as _os
 import sys as _sys
-import select as _select
+import selectors as _selectors
 import tty as _tty
 import termios as _termios
 
@@ -51,15 +51,25 @@ class Terminal(TerminalBase):
             del self._tx_buf[:count]
 
     def _loop(self):
-        rd_fds = [self._stdin_fd, self._conn.fd]
-        while self._running:
-            # Only watch for writability while there is something to send,
-            # otherwise select() would busy-loop on the always-writable fd.
-            wr_fds = [self._conn.fd] if self._tx_buf else []
-            readable, writable, _ = _select.select(rd_fds, wr_fds, [], 1)
-            if self._stdin_fd in readable:
-                self._read_event_terminal()
-            if self._conn.fd in readable:
-                self._read_event_device()
-            if self._conn.fd in writable:
-                self._flush_tx()
+        conn_fd = self._conn.fd
+        with _selectors.DefaultSelector() as selector:
+            selector.register(self._stdin_fd, _selectors.EVENT_READ)
+            selector.register(conn_fd, _selectors.EVENT_READ)
+            watch_write = False
+            while self._running:
+                # Only watch for writability while there is something to send,
+                # otherwise select() would busy-loop on the always-writable fd.
+                if bool(self._tx_buf) != watch_write:
+                    watch_write = not watch_write
+                    events = _selectors.EVENT_READ
+                    if watch_write:
+                        events |= _selectors.EVENT_WRITE
+                    selector.modify(conn_fd, events)
+                ready = {key.fd: mask for key, mask in selector.select(1)}
+                if ready.get(self._stdin_fd, 0) & _selectors.EVENT_READ:
+                    self._read_event_terminal()
+                conn_events = ready.get(conn_fd, 0)
+                if conn_events & _selectors.EVENT_READ:
+                    self._read_event_device()
+                if conn_events & _selectors.EVENT_WRITE:
+                    self._flush_tx()

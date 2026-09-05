@@ -1,7 +1,7 @@
 """MicroPython tool: abstract connector"""
 
 import time as _time
-import select as _select
+import selectors as _selectors
 
 from mpytool.logger import SimpleColorLogger as _SimpleColorLogger
 
@@ -23,10 +23,12 @@ class Conn():
         self._buffer = bytearray()
         self._escape_handlers = {}  # {escape_byte: handler}
         self._active_handler = None  # Currently processing handler
+        self._selector = None
+        self._selector_fd = None
 
     @property
     def fd(self):
-        """Return file descriptor for select()"""
+        """Return file descriptor for the selector"""
         return None
 
     def register_escape_handler(self, escape, handler):
@@ -45,16 +47,42 @@ class Conn():
         if self._active_handler is self._escape_handlers.get(escape):
             self._active_handler = None
 
+    def _selector_close(self):
+        """Drop the cached selector (fd is gone or about to be reused)."""
+        if self._selector is not None:
+            self._selector.close()
+            self._selector = None
+            self._selector_fd = None
+
+    def _get_selector(self, fd):
+        """Return selector registered for fd, cached between calls.
+
+        _has_data() runs in tight polling loops, so the selector (and the
+        kernel object behind it on epoll/kqueue) is built only once. It must
+        be invalidated by _selector_close() whenever the fd is closed - a
+        reopened port usually gets the very same fd number back, while the
+        stale registration is already dropped by the kernel.
+        """
+        if self._selector is None:
+            self._selector = _selectors.DefaultSelector()
+            self._selector.register(fd, _selectors.EVENT_READ)
+            self._selector_fd = fd
+        elif self._selector_fd != fd:
+            self._selector.unregister(self._selector_fd)
+            self._selector.register(fd, _selectors.EVENT_READ)
+            self._selector_fd = fd
+        return self._selector
+
     def _has_data(self, timeout=0):
-        """Check if data is available to read using select()"""
+        """Check if data is available to read using a selector"""
         if self._active_handler and hasattr(self._active_handler, 'pending'):
             if self._active_handler.pending:
                 return True
         fd = self.fd
         if fd is None:
+            self._selector_close()
             return False
-        readable, _, _ = _select.select([fd], [], [], timeout)
-        return bool(readable)
+        return bool(self._get_selector(fd).select(timeout))
 
     def _read_available(self):
         """Read available data from device (must be implemented by subclass)"""
@@ -207,6 +235,7 @@ class Conn():
 
     def close(self):
         """Close connection"""
+        self._selector_close()
 
     def discard_output(self):
         """Discard buffered output not yet transmitted (no-op by default).

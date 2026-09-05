@@ -42,6 +42,7 @@ class ConnSerial(_conn.Conn):
             self._log.info("Connected to %s [unknown serial port]", port)
 
     def close(self):
+        super().close()
         if self._serial:
             # Prevent ESP32 reset when driver clears DTR/RTS on close
             # Only for USB-UART bridges (CP2102, CH340, etc.), not USB-CDC
@@ -156,6 +157,7 @@ class ConnSerial(_conn.Conn):
             timeout = self.RECONNECT_TIMEOUT
         port = self._serial_config.get('port', 'unknown')
         if self._serial:
+            self._selector_close()  # fd is gone, reopen may reuse its number
             try:
                 self._serial.close()
             except (OSError, _serial.serialutil.SerialException):
