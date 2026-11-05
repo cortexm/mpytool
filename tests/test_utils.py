@@ -1,13 +1,24 @@
 """Tests for utility functions"""
 
+import os
+import shutil
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
+
+from mpytool.conn import ConnError
 from mpytool.utils import (
     is_remote_path,
     parse_remote_path,
     split_commands,
     detect_serial_ports,
     detect_serial_ports_info,
+    certs_dir,
+    config_dir,
+    list_cert_profiles,
+    resolve_cert_profile,
+    resolve_tls,
 )
 
 
@@ -314,6 +325,220 @@ class TestGetPortInfo(unittest.TestCase):
         mock_comports.return_value = []
         info = get_port_info('/dev/nonexistent')
         self.assertIsNone(info)
+
+
+class TestConfigDir(unittest.TestCase):
+    """Configuration directory resolution"""
+
+    def test_env_override_wins(self):
+        with patch.dict(os.environ, {'MPYTOOL_CONFIG_DIR': '/custom/cfg'}):
+            self.assertEqual(config_dir(), '/custom/cfg')
+            self.assertEqual(certs_dir(), os.path.join('/custom/cfg', 'certs'))
+
+    def test_xdg_config_home(self):
+        env = {'XDG_CONFIG_HOME': '/xdg'}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop('MPYTOOL_CONFIG_DIR', None)
+            self.assertEqual(config_dir(), os.path.join('/xdg', 'mpytool'))
+
+    def test_default_is_under_home(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('MPYTOOL_CONFIG_DIR', None)
+            os.environ.pop('XDG_CONFIG_HOME', None)
+            self.assertTrue(config_dir().endswith(os.path.join('mpytool')))
+
+
+class TestCertStore(unittest.TestCase):
+    """TLS profile resolution from the certificate store"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = os.path.join(self.tmpdir, 'certs')
+        os.makedirs(self.store)
+        patcher = patch.dict(
+            os.environ, {'MPYTOOL_CONFIG_DIR': self.tmpdir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _write(self, *parts, mode=0o600, content=b'x'):
+        path = os.path.join(self.store, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as file:
+            file.write(content)
+        os.chmod(path, mode)
+        return path
+
+    def test_profile_dir_full(self):
+        """Profile directory with cert, key and ca"""
+        cert = self._write('board', 'cert.pem')
+        key = self._write('board', 'key.pem')
+        ca = self._write('board', 'ca.pem')
+        self.assertEqual(resolve_cert_profile('board'), (cert, key, ca))
+
+    def test_profile_dir_cert_only(self):
+        """Missing key.pem means the key is inside cert.pem"""
+        cert = self._write('board', 'cert.pem')
+        self.assertEqual(resolve_cert_profile('board'), (cert, None, None))
+
+    def test_profile_dir_without_cert(self):
+        """A profile directory must hold cert.pem"""
+        self._write('board', 'key.pem')
+        with self.assertRaises(ConnError) as ctx:
+            resolve_cert_profile('board')
+        self.assertIn('cert.pem', str(ctx.exception))
+
+    def test_bundle(self):
+        """Combined name.pem bundle"""
+        bundle = self._write('lab.pem')
+        self.assertEqual(resolve_cert_profile('lab'), (bundle, None, None))
+
+    def test_profile_dir_wins_over_bundle(self):
+        cert = self._write('board', 'cert.pem')
+        self._write('board.pem')
+        self.assertEqual(resolve_cert_profile('board')[0], cert)
+
+    def test_unknown_profile_lists_available(self):
+        self._write('board', 'cert.pem')
+        self._write('lab.pem')
+        with self.assertRaises(ConnError) as ctx:
+            resolve_cert_profile('nope')
+        message = str(ctx.exception)
+        self.assertIn('board', message)
+        self.assertIn('lab', message)
+
+    def test_unknown_profile_empty_store(self):
+        with self.assertRaises(ConnError) as ctx:
+            resolve_cert_profile('nope')
+        self.assertIn('none', str(ctx.exception))
+
+    def test_list_profiles(self):
+        self._write('board', 'cert.pem')
+        self._write('lab.pem')
+        self._write('notes.txt')
+        self.assertEqual(list_cert_profiles(), ['board', 'lab'])
+
+    def test_list_profiles_missing_store(self):
+        shutil.rmtree(self.store)
+        self.assertEqual(list_cert_profiles(), [])
+
+    def test_direct_path_to_dir(self):
+        cert = self._write('board', 'cert.pem')
+        path = os.path.join(self.store, 'board')
+        self.assertEqual(resolve_cert_profile(path), (cert, None, None))
+
+    def test_direct_path_to_file(self):
+        bundle = self._write('lab.pem')
+        self.assertEqual(resolve_cert_profile(bundle), (bundle, None, None))
+
+    def test_direct_path_missing(self):
+        with self.assertRaises(ConnError):
+            resolve_cert_profile(os.path.join(self.tmpdir, 'no', 'such'))
+
+
+class TestResolveTls(unittest.TestCase):
+    """TLS configuration dict normalization"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = os.path.join(self.tmpdir, 'certs', 'board')
+        os.makedirs(self.store)
+        for name in ('cert.pem', 'key.pem', 'ca.pem'):
+            path = os.path.join(self.store, name)
+            with open(path, 'wb') as file:
+                file.write(b'x')
+            os.chmod(path, 0o600)
+        patcher = patch.dict(
+            os.environ, {'MPYTOOL_CONFIG_DIR': self.tmpdir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def test_true_means_defaults(self):
+        self.assertEqual(resolve_tls(True), {})
+
+    def test_empty_dict_stays_empty(self):
+        self.assertEqual(resolve_tls({}), {})
+
+    def test_unknown_key_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            resolve_tls({'insecrue': True})
+        self.assertIn('insecrue', str(ctx.exception))
+
+    def test_wrong_type_rejected(self):
+        with self.assertRaises(ValueError):
+            resolve_tls('myprofile')
+
+    def test_profile_expanded(self):
+        tls = resolve_tls({'profile': 'board'})
+        self.assertNotIn('profile', tls)
+        self.assertEqual(tls['cert'], os.path.join(self.store, 'cert.pem'))
+        self.assertEqual(tls['key'], os.path.join(self.store, 'key.pem'))
+        self.assertEqual(tls['ca'], os.path.join(self.store, 'ca.pem'))
+
+    def test_explicit_ca_wins_over_profile(self):
+        tls = resolve_tls({'profile': 'board', 'ca': '/other/ca.pem'})
+        self.assertEqual(tls['ca'], '/other/ca.pem')
+
+    def test_input_not_modified(self):
+        source = {'profile': 'board'}
+        resolve_tls(source)
+        self.assertEqual(source, {'profile': 'board'})
+
+    def test_flags_passed_through(self):
+        tls = resolve_tls({'insecure': True, 'check_hostname': False})
+        self.assertTrue(tls['insecure'])
+        self.assertFalse(tls['check_hostname'])
+
+
+@unittest.skipIf(sys.platform == 'win32', "POSIX permissions only")
+class TestKeyPermissions(unittest.TestCase):
+    """Private key permission check"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.key = os.path.join(self.tmpdir, 'key.pem')
+        with open(self.key, 'wb') as file:
+            file.write(b'x')
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def test_private_key_accepted(self):
+        os.chmod(self.key, 0o600)
+        resolve_tls({'cert': 'c.pem', 'key': self.key})
+
+    def test_group_readable_key_refused(self):
+        os.chmod(self.key, 0o640)
+        with self.assertRaises(ConnError) as ctx:
+            resolve_tls({'cert': 'c.pem', 'key': self.key})
+        self.assertIn('chmod 600', str(ctx.exception))
+
+    def test_world_readable_key_refused(self):
+        os.chmod(self.key, 0o644)
+        with self.assertRaises(ConnError):
+            resolve_tls({'cert': 'c.pem', 'key': self.key})
+
+    def test_insecure_downgrades_to_warning(self):
+        os.chmod(self.key, 0o644)
+        warnings = []
+
+        class _Log:
+            def warning(self, message, *args):
+                warnings.append(message % args if args else message)
+
+        resolve_tls(
+            {'cert': 'c.pem', 'key': self.key, 'insecure': True}, log=_Log())
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('accessible by other users', warnings[0])
+
+    def test_bundle_permissions_checked(self):
+        """Without a key file the cert file holds the private key"""
+        os.chmod(self.key, 0o644)
+        with self.assertRaises(ConnError):
+            resolve_tls({'cert': self.key})
+
+    def test_missing_key_file_not_checked(self):
+        """A missing file is reported later by the TLS layer"""
+        resolve_tls({'cert': '/nonexistent/cert.pem'})
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import base64
 import unittest
 from unittest.mock import Mock, patch
 from mpytool.mpy import (
-    _escape_path, Mpy, parse_esp_image, esp_chip_name)
+    _escape_path, Mpy, parse_esp_image, esp_chip_name, RESET_DELAY_MS)
 import mpytool.mpy_comm as mpy_comm
 
 
@@ -483,6 +483,89 @@ class TestChdir(unittest.TestCase):
         self.mpy.chdir('..')
         call_args = self.mpy._mpy_comm.exec.call_args_list[-1][0][0]
         self.assertIn("os.chdir('..')", call_args)
+
+
+class TestDelayedMachineReset(unittest.TestCase):
+    """The device must drop off USB only after the host closed the port"""
+
+    def setUp(self):
+        self.conn = Mock()
+        self.mpy = Mpy(self.conn)
+        self.comm = Mock()
+        self.mpy._mpy_comm = self.comm
+        patcher = patch('mpytool.mpy._time.sleep')
+        self.sleep = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.calls = Mock()
+        self.calls.attach_mock(self.conn, 'conn')
+        self.calls.attach_mock(self.comm, 'comm')
+        self.calls.attach_mock(self.sleep, 'sleep')
+
+    def _order(self):
+        return [call[0] for call in self.calls.mock_calls if call[0] in (
+            'comm.exec', 'conn.close', 'sleep', 'conn.reconnect',
+            'comm.drain_input')]
+
+    def _reset_code(self):
+        return self.comm.exec.call_args_list[-1].args[0]
+
+    def test_no_reconnect_closes_then_waits(self):
+        self.assertFalse(self.mpy.machine_reset(reconnect=False))
+        self.assertEqual(
+            self._order(), ['comm.exec', 'comm.exec', 'conn.close', 'sleep'])
+        self.conn.reconnect.assert_not_called()
+
+    def test_reconnect_opens_only_after_wait(self):
+        self.assertTrue(self.mpy.machine_reset(reconnect=True, timeout=7))
+        self.assertEqual(self._order(), [
+            'comm.exec', 'comm.exec', 'conn.close', 'sleep',
+            'conn.reconnect', 'comm.drain_input'])
+        self.conn.reconnect.assert_called_once_with(timeout=7)
+
+    def test_host_waits_longer_than_device_delay(self):
+        self.mpy.machine_reset(reconnect=False)
+        self.assertGreater(self.sleep.call_args.args[0], RESET_DELAY_MS / 1000)
+
+    def test_reset_is_delayed_on_device(self):
+        self.mpy.machine_reset(reconnect=False)
+        self.assertEqual(
+            self._reset_code(),
+            f"time.sleep_ms({RESET_DELAY_MS});machine.reset()")
+
+    def test_reset_is_submit_only(self):
+        """timeout=0 waits for the device's OK, not for the (dead) result"""
+        self.mpy.machine_reset(reconnect=False)
+        self.assertEqual(self.comm.exec.call_args_list[-1].kwargs['timeout'], 0)
+
+    def test_imports_are_not_in_reset_command(self):
+        """With a mount active an import after close would hang the device"""
+        self.mpy.machine_reset(reconnect=False)
+        self.assertEqual(
+            self.comm.exec.call_args_list[0].args[0], "import machine,time")
+        self.assertNotIn('import', self._reset_code())
+
+    def test_state_reset_before_close(self):
+        """No later exit_raw_repl() may write to the closed port"""
+        self.mpy.machine_reset(reconnect=False)
+        names = [call[0] for call in self.calls.mock_calls]
+        self.assertLess(
+            names.index('comm.reset_state'), names.index('conn.close'))
+
+    def test_failed_submit_keeps_port_open(self):
+        """Reset not accepted: report it, nothing to wait for"""
+        self.comm.exec.side_effect = mpy_comm.MpyError('no OK')
+        with self.assertRaises(mpy_comm.MpyError):
+            self.mpy.machine_reset(reconnect=True)
+        self.conn.close.assert_not_called()
+        self.conn.reconnect.assert_not_called()
+
+    def test_bootloader_closes_then_waits(self):
+        self.mpy.machine_bootloader()
+        self.assertEqual(
+            self._order(), ['comm.exec', 'comm.exec', 'conn.close', 'sleep'])
+        self.assertEqual(
+            self._reset_code(),
+            f"time.sleep_ms({RESET_DELAY_MS});machine.bootloader()")
 
 
 class TestWipe(unittest.TestCase):

@@ -34,5 +34,26 @@ class TestReconnectTermiosError(unittest.TestCase):
             ConnSerial(port='/dev/ttyTEST')
 
 
+class TestCloseThenReconnect(unittest.TestCase):
+    """A delayed machine reset closes the port itself, before reconnecting."""
+
+    @patch('mpytool.conn_serial._serial.Serial')
+    def test_close_tolerates_port_already_gone(self, mock_serial):
+        mock_serial.return_value.close.side_effect = OSError(6, 'gone')
+        c = ConnSerial(port='/dev/ttyTEST')
+        c.close()
+        self.assertIsNone(c.fd)
+
+    @patch('mpytool.conn_serial._time.sleep')
+    @patch('mpytool.conn_serial._serial.Serial')
+    def test_reconnect_reopens_closed_port(self, mock_serial, _sleep):
+        c = ConnSerial(port='/dev/ttyTEST')
+        c.close()
+        mock_serial.reset_mock()
+        self.assertTrue(c.reconnect(timeout=1))
+        mock_serial.assert_called_once_with(port='/dev/ttyTEST')
+        self.assertIsNotNone(c.fd)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,7 +52,10 @@ class ConnSerial(_conn.Conn):
                     self._serial.dtr = False
                 except OSError:
                     pass
-            self._serial.close()
+            try:
+                self._serial.close()
+            except _PORT_OPEN_ERRORS:
+                pass  # Port may already be gone
             self._serial = None
 
     def __del__(self):

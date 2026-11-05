@@ -18,6 +18,25 @@ _mpytool_get_options() {
     mpytool _options "$1" 2>/dev/null | cut -d: -f1 | tr '\n' ' '
 }
 
+_mpytool_cert_profiles() {
+    # TLS profile names from the certificate store (mirrors config_dir())
+    local store
+    if [[ -n "$MPYTOOL_CONFIG_DIR" ]]; then
+        store="$MPYTOOL_CONFIG_DIR/certs"
+    else
+        store="${XDG_CONFIG_HOME:-$HOME/.config}/mpytool/certs"
+    fi
+    [[ -d "$store" ]] || return
+    local entry
+    for entry in "$store"/*; do
+        if [[ -d "$entry" ]]; then
+            basename "$entry"
+        elif [[ "$entry" == *.pem ]]; then
+            basename "$entry" .pem
+        fi
+    done
+}
+
 _mpytool_get_args() {
     # Get argument info for a command: type:nargs:description
     # $1 = command name
@@ -170,8 +189,12 @@ _mpytool() {
         -a|--address)
             return
             ;;
-        --ssl-ca)
+        --tls-ca|--ssl-ca)
             COMPREPLY=($(compgen -f -- "$cur"))
+            return
+            ;;
+        --mtls)
+            COMPREPLY=($(compgen -W "$(_mpytool_cert_profiles)" -- "$cur"))
             return
             ;;
     esac

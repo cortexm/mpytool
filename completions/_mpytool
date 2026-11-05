@@ -27,6 +27,24 @@ _mpytool_detect_ports() {
     mpytool ports 2>/dev/null
 }
 
+_mpytool_certs_dir() {
+    # Certificate store, mirrors utils.config_dir()
+    if [[ -n "$MPYTOOL_CONFIG_DIR" ]]; then
+        print -r -- "$MPYTOOL_CONFIG_DIR/certs"
+    else
+        print -r -- "${XDG_CONFIG_HOME:-$HOME/.config}/mpytool/certs"
+    fi
+}
+
+_mpytool_cert_profiles() {
+    # Profile names: subdirectories and .pem bundles in the store
+    local store profiles
+    store="$(_mpytool_certs_dir)"
+    [[ -d "$store" ]] || return
+    profiles=(${store}/*(/N:t) ${store}/*.pem(.N:t:r))
+    [[ ${#profiles[@]} -gt 0 ]] && _describe -t profiles 'TLS profile' profiles
+}
+
 _mpytool_ports() {
     # Complete serial ports with descriptions
     local -a ports descs
@@ -133,10 +151,11 @@ _mpytool() {
         '--port[serial port]:port:_mpytool_ports' \
         '-a[network address]:address:' \
         '--address[network address]:address:' \
-        '--ssl[use SSL/TLS]' \
-        '--ssl-no-verify[disable SSL certificate verification]' \
-        '--ssl-ca[CA certificate file]:file:_files' \
-        '--ssl-no-hostname[disable SSL hostname verification]' \
+        '--tls[use TLS]' \
+        '--tls-ca[CA certificate file]:file:_files' \
+        '--mtls[client certificate profile]:profile:_mpytool_cert_profiles' \
+        '--tls-insecure[warn instead of failing on certificate problems]' \
+        '--tls-no-hostname[skip hostname verification]' \
         '-b[baud rate]:baud:(9600 19200 38400 57600 115200 230400 460800 921600)' \
         '--baud[baud rate]:baud:(9600 19200 38400 57600 115200 230400 460800 921600)' \
         '-d[debug level]' \

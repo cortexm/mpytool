@@ -107,44 +107,78 @@ conn.reconnect(timeout=5)   # Reconnect after device reset (USB-CDC)
 
 ### ConnSocket
 
-TCP socket connection for network-connected devices with optional SSL/TLS.
+TCP socket connection for network-connected devices with optional TLS.
 
 ```python
-mpytool.ConnSocket(address, log=None, ssl=False, ssl_verify=True,
-    ssl_ca=None, ssl_check_hostname=True)
+mpytool.ConnSocket(address, log=None, tls=None)
 ```
 
 **Parameters:**
 - `address` (str): Host address with optional port (e.g., `192.168.1.100` or `192.168.1.100:8266`)
 - `log`: Optional logger instance
-- `ssl` (bool): Enable SSL/TLS encryption (default: `False`)
-- `ssl_verify` (bool): Verify server certificate (default: `True`). Set to `False` for self-signed certs.
-- `ssl_ca` (str): Path to CA certificate file for custom certificate authorities
-- `ssl_check_hostname` (bool): Verify hostname matches certificate (default: `True`). Set to `False` when one cert is shared across multiple hosts.
+- `tls`: `None` for plain TCP, `True` for TLS with defaults, or a dict
 
 Default port is 23 if not specified.
+
+**TLS dict keys** (an unknown key raises `ValueError` rather than being ignored):
+- `profile` (str): Name in the certificate store, expanded into `cert` / `key` / `ca`. A name containing a path separator is used as a direct path.
+- `cert` (str): Client certificate for mutual TLS
+- `key` (str): Private key (omit when the key is inside `cert`)
+- `key_password` (str): Password for an encrypted private key
+- `ca` (str): CA certificate used **instead of** the system CAs
+- `insecure` (bool): Report certificate verification failures as a warning and connect anyway (default: `False`)
+- `check_hostname` (bool): Verify the hostname matches the certificate (default: `True`)
 
 **Examples:**
 ```python
 # Plain TCP
 conn = mpytool.ConnSocket(address='192.168.1.100:8266')
 
-# SSL with system CA
-conn = mpytool.ConnSocket(address='server:8023', ssl=True)
+# TLS with system CAs
+conn = mpytool.ConnSocket(address='server:8023', tls=True)
 
-# SSL with custom CA
-conn = mpytool.ConnSocket(address='server:8023', ssl=True, ssl_ca='ca.pem')
+# TLS with custom CA (replaces the system CAs)
+conn = mpytool.ConnSocket(address='server:8023', tls={'ca': 'ca.pem'})
 
-# SSL, verify cert but skip hostname check
+# TLS, verify cert but skip hostname check
 conn = mpytool.ConnSocket(address='192.168.1.100:8023',
-    ssl=True, ssl_ca='ca.pem', ssl_check_hostname=False)
+    tls={'ca': 'ca.pem', 'check_hostname': False})
 
-# SSL without any verification (insecure)
-conn = mpytool.ConnSocket(address='server:8023', ssl=True, ssl_verify=False)
+# Mutual TLS from the certificate store
+conn = mpytool.ConnSocket(address='server:8023', tls={'profile': 'myboard'})
+
+# Mutual TLS with explicit paths
+conn = mpytool.ConnSocket(address='server:8023',
+    tls={'cert': 'client.crt', 'key': 'client.key', 'ca': 'ca.pem'})
+
+# Warn on a verification failure instead of refusing to connect
+conn = mpytool.ConnSocket(address='server:8023', tls={'insecure': True})
 ```
 
+Note that `tls={}` is not the same as `tls=None` - an empty dict means TLS
+with defaults, `None` means plain TCP.
+
 **Raises:**
-- `ConnError`: If unable to connect or SSL handshake fails
+- `ConnError`: If unable to connect, the TLS handshake fails, the profile does not exist, or the private key is readable by other users
+- `ValueError`: If `tls` is not a dict/`True`, or contains an unknown key
+
+### Certificate store
+
+Named client certificate profiles live in `~/.config/mpytool/certs/`
+(`%APPDATA%\mpytool\certs\` on Windows, or `$MPYTOOL_CONFIG_DIR/certs`),
+either as a directory holding `cert.pem` / `key.pem` / `ca.pem` or as a
+single combined `<name>.pem` bundle.
+
+```python
+mpytool.config_dir()             # -> configuration directory
+mpytool.certs_dir()              # -> certificate store directory
+mpytool.list_cert_profiles()     # -> ['lab', 'myboard']
+mpytool.resolve_cert_profile(name)   # -> (cert, key, ca), key/ca may be None
+mpytool.resolve_tls(tls, log=None)   # -> normalized dict without 'profile'
+```
+
+`resolve_tls()` is what `ConnSocket` calls internally; use it directly to
+inspect the resolved paths or to reuse them elsewhere.
 
 ### Common Connection Methods
 
@@ -934,6 +968,11 @@ mpy.machine_reset(reconnect=True)
 **Parameters:**
 - `reconnect` (bool): If True, attempt to reconnect after reset (for USB-CDC ports)
 - `timeout` (int): Reconnect timeout in seconds (None = default)
+
+The device delays the reset by 300 ms, so the connection is closed before the
+device leaves USB, and the call blocks about 0.8 s until it should be gone.
+`machine_bootloader()` and `wipe()` behave the same way. With `reconnect=False`
+the connection stays **closed**; call `conn.reconnect()` to reopen it.
 
 #### hard_reset()
 

@@ -32,7 +32,8 @@ It is an alternative to the official [mpremote](https://docs.micropython.org/en/
 - **Raw-paste mode** - flow-controlled code execution with reduced
   RAM usage (API)
 - **Shell completion** - ZSH and Bash with remote path completion
-- **Network support** - connect over TCP with optional SSL/TLS
+- **Network support** - connect over TCP with optional TLS, including mutual
+  TLS with named client certificate profiles
 - **Full Unicode support** - handles Unicode in file names and content
 
 See [README_mpremote.md](README_mpremote.md) for detailed comparison with mpremote.
@@ -300,6 +301,11 @@ REPL (Ctrl+] to exit)
 $ mpytool sleep 2            # sleep for 2 seconds (useful between commands)
 SLEEP 2.0s
 ```
+
+`reset --machine`, `reset --boot` and `wipe` close the port before the device
+leaves USB: the device delays the reset by 300 ms and the command returns about
+0.8 s after sending it. Closing a USB-CDC port while the device disappears has
+been linked to macOS kernel panics.
 
 ### Wipe device (erase all files + machine reset)
 ```
@@ -669,11 +675,62 @@ TREE: /
 ```
 $ mpytool -a 192.168.1.100 ls                          # plain TCP
 $ mpytool -a 192.168.1.100:8266 tree                   # custom port
-$ mpytool -a 192.168.1.100:8023 --ssl ls               # SSL/TLS connection
-$ mpytool -a 192.168.1.100:8023 --ssl-ca ca.pem ls     # SSL with custom CA
-$ mpytool -a 192.168.1.100:8023 --ssl-no-hostname ls   # SSL, skip hostname check
-$ mpytool -a 192.168.1.100:8023 --ssl-no-verify ls     # SSL, skip all verification
+$ mpytool -a 192.168.1.100:8023 --tls ls               # TLS connection
+$ mpytool -a 192.168.1.100:8023 --tls-ca ca.pem ls     # TLS with custom CA
+$ mpytool -a 192.168.1.100:8023 --tls-no-hostname ls   # TLS, skip hostname check
+$ mpytool -a 192.168.1.100:8023 --tls-insecure ls      # TLS, warn instead of fail
 ```
+
+The certificate is **always** verified. `--tls-insecure` does not skip the
+check - it reports the failure as a warning and connects anyway, so you still
+learn *what* was wrong (expired, hostname mismatch, unknown CA).
+
+`--tls-ca` is used **instead of** the system certificate authorities, not in
+addition to them: against a private PKI only your own CA should be able to
+vouch for the device. Note that on macOS the system store means the bundle
+Python's OpenSSL was built with (`certifi` or Homebrew `ca-certificates`) -
+a CA imported into the Keychain is **not** picked up, so a private CA has to
+be passed explicitly.
+
+### Mutual TLS (client certificate)
+
+`--mtls NAME` picks a named profile from the certificate store, so the paths
+do not have to be repeated on every invocation:
+
+```
+$ mpytool -a 192.168.1.100:8023 --mtls myboard ls
+```
+
+Profiles live in `~/.config/mpytool/certs/` (`%APPDATA%\mpytool\certs\` on
+Windows, or `$MPYTOOL_CONFIG_DIR/certs`), either as a directory with fixed
+file names or as a single combined bundle:
+
+```
+~/.config/mpytool/certs/
+    myboard/
+        cert.pem      # client certificate (required)
+        key.pem       # private key (optional if cert.pem holds it too)
+        ca.pem        # CA for verifying the device (optional)
+    lab.pem           # bundle: certificate and key in one file
+```
+
+`--mtls` implies `--tls`. A `ca.pem` inside the profile is used automatically,
+an explicit `--tls-ca` overrides it. A name containing a path separator is
+taken as a direct path to such a directory or bundle instead of a lookup in
+the store.
+
+The private key must not be readable by other users - like ssh, mpytool
+refuses to use a key with loose permissions:
+
+```
+$ mpytool -a board:8023 --mtls myboard ls
+E: private key ~/.config/mpytool/certs/myboard/key.pem is accessible by other
+   users (0644), run: chmod 600 ~/.config/mpytool/certs/myboard/key.pem
+   (or use --tls-insecure)
+```
+
+The pre-2.8.0 flag names (`--ssl`, `--ssl-ca`, `--ssl-no-verify`,
+`--ssl-no-hostname`) still work as hidden aliases.
 
 ### Set baudrate (default 115200)
 ```

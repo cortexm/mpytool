@@ -13,6 +13,12 @@ from mpytool.logger import SimpleColorLogger as _SimpleColorLogger
 # Timeout for flash I/O operations (open/close/gc) - some FLASH GC can block >5s
 FLASH_IO_TIMEOUT = 20
 
+# Delayed machine.reset()/bootloader(): the device waits RESET_DELAY_MS so the
+# host can close the port first, the host then waits RESET_SETTLE more seconds
+# for the device to drop off USB before anything may reopen the port.
+RESET_DELAY_MS = 300
+RESET_SETTLE = 0.5
+
 
 def _escape_path(path: str) -> str:
     """Escape path for use in Python string literal"""
@@ -1549,8 +1555,34 @@ def _mt_appimg(label, size=256):
         self._mpy_comm.soft_reset_raw()
         self.reset_state()
 
+    def _machine_call_after_close(self, call):
+        """Close the connection, then let the device run machine.<call>()
+
+        Closing a USB-CDC port while its device drops off the bus has panicked
+        the macOS kernel (com.apple.driver.usb.cdc). The device therefore
+        delays the call, so it leaves USB with no port open on the host.
+        Returns once the device should be gone, so a following open (also from
+        another process) does not catch it just before the reset.
+
+        Arguments:
+            call: name of the machine function to call, e.g. 'reset'
+        """
+        # Imports run separately: with a mount active they can query the VFS
+        # on the host, which would hang the device once the port is closed.
+        self._mpy_comm.exec("import machine,time", timeout=5)
+        # timeout=0 returns after the device's OK: it has the command, so the
+        # delay is running and closing the port cannot lose the reset.
+        self._mpy_comm.exec(
+            f"time.sleep_ms({RESET_DELAY_MS});machine.{call}()", timeout=0)
+        self.reset_state()
+        self._conn.close()
+        _time.sleep(RESET_DELAY_MS / 1000 + RESET_SETTLE)
+
     def machine_reset(self, reconnect=True, timeout=None):
         """MCU reset using machine.reset()
+
+        The connection is closed before the device resets. Without reconnect
+        it stays closed (conn.reconnect() can reopen it later).
 
         Arguments:
             reconnect: if True, attempt to reconnect after reset
@@ -1561,9 +1593,7 @@ def _mt_appimg(label, size=256):
 
         Note: For USB-CDC ports, the port may disappear and reappear.
         """
-        self._mpy_comm.enter_raw_repl()
-        self._conn.write(b"import machine; machine.reset()\x04")
-        self.reset_state()
+        self._machine_call_after_close('reset')
         if reconnect:
             self._conn.reconnect(timeout=timeout)
             # Drain the post-reset boot banner / '>>> ' prompt so the next
@@ -1599,11 +1629,9 @@ def _mt_appimg(label, size=256):
     def machine_bootloader(self):
         """Enter bootloader using machine.bootloader()
 
-        Note: Connection will be lost after this call.
+        Note: The connection is closed by this call.
         """
-        self._mpy_comm.enter_raw_repl()
-        self._conn.write(b"import machine; machine.bootloader()\x04")
-        self.reset_state()
+        self._machine_call_after_close('bootloader')
 
     def hard_reset(self):
         """Hardware reset using RTS signal (serial only)

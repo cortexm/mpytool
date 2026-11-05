@@ -5,6 +5,8 @@ import sys as _sys
 
 from serial.tools.list_ports import comports as _comports
 
+from mpytool.conn import ConnError as _ConnError
+
 
 def setup_utf8_encoding():
     """Reconfigure stdout/stderr to UTF-8 on Windows.
@@ -225,3 +227,176 @@ def get_port_info(port: str):
         if p.device == port or p.device == resolved:
             return p
     return None
+
+
+# Recognized keys of a TLS configuration dict. Unknown keys are rejected
+# rather than ignored - a typo like {'insecrue': True} would otherwise
+# silently keep verification enabled.
+_TLS_KEYS = frozenset({
+    'profile', 'cert', 'key', 'ca', 'insecure', 'check_hostname',
+    'key_password'})
+
+# Fixed file names inside a certificate profile directory
+_PROFILE_CERT = 'cert.pem'
+_PROFILE_KEY = 'key.pem'
+_PROFILE_CA = 'ca.pem'
+
+
+def config_dir() -> str:
+    """Get mpytool configuration directory (not created, may not exist)
+
+    Order: $MPYTOOL_CONFIG_DIR, $XDG_CONFIG_HOME/mpytool,
+    %APPDATA%\\mpytool (Windows), ~/.config/mpytool
+    """
+    env_dir = _os.environ.get('MPYTOOL_CONFIG_DIR')
+    if env_dir:
+        return env_dir
+    xdg_dir = _os.environ.get('XDG_CONFIG_HOME')
+    if xdg_dir:
+        return _os.path.join(xdg_dir, 'mpytool')
+    if _sys.platform == 'win32':
+        app_data = _os.environ.get('APPDATA')
+        if app_data:
+            return _os.path.join(app_data, 'mpytool')
+    return _os.path.expanduser('~/.config/mpytool')
+
+
+def certs_dir() -> str:
+    """Get certificate store directory (not created, may not exist)"""
+    return _os.path.join(config_dir(), 'certs')
+
+
+def list_cert_profiles() -> list[str]:
+    """List TLS profile names available in the certificate store
+
+    Returns:
+        sorted list of names (profile directories and .pem bundles)
+    """
+    store = certs_dir()
+    try:
+        entries = _os.listdir(store)
+    except OSError:
+        return []
+    names = set()
+    for entry in entries:
+        if _os.path.isdir(_os.path.join(store, entry)):
+            names.add(entry)
+        elif entry.endswith('.pem'):
+            names.add(entry[:-len('.pem')])
+    return sorted(names)
+
+
+def _resolve_profile_dir(path: str, name: str):
+    """Resolve a profile directory to (cert, key, ca) paths"""
+    cert = _os.path.join(path, _PROFILE_CERT)
+    if not _os.path.isfile(cert):
+        raise _ConnError(
+            f"TLS profile '{name}' has no {_PROFILE_CERT} in {path}")
+    key = _os.path.join(path, _PROFILE_KEY)
+    ca = _os.path.join(path, _PROFILE_CA)
+    return (
+        cert,
+        key if _os.path.isfile(key) else None,
+        ca if _os.path.isfile(ca) else None)
+
+
+def resolve_cert_profile(name: str):
+    """Resolve a TLS profile name to certificate paths
+
+    A name is looked up in the certificate store, first as a directory
+    holding cert.pem / key.pem / ca.pem, then as a combined name.pem
+    bundle. A name containing a path separator is used as a direct path
+    to such a directory or bundle instead.
+
+    Arguments:
+        name: profile name or path
+
+    Returns:
+        (cert, key, ca) tuple, key and ca may be None (key None means the
+        private key is expected inside the certificate file)
+    """
+    is_path = _os.sep in name or (_os.altsep and _os.altsep in name)
+    if is_path:
+        path = _os.path.expanduser(name)
+        if _os.path.isdir(path):
+            return _resolve_profile_dir(path, name)
+        if _os.path.isfile(path):
+            return path, None, None
+        raise _ConnError(f"TLS profile not found: {name}")
+    store = certs_dir()
+    profile_dir = _os.path.join(store, name)
+    if _os.path.isdir(profile_dir):
+        return _resolve_profile_dir(profile_dir, name)
+    bundle = _os.path.join(store, f'{name}.pem')
+    if _os.path.isfile(bundle):
+        return bundle, None, None
+    available = list_cert_profiles()
+    hint = ', '.join(available) if available else 'none'
+    raise _ConnError(
+        f"TLS profile '{name}' not found in {store} (available: {hint})")
+
+
+def _check_key_permissions(path: str, insecure: bool, log=None):
+    """Reject a private key readable by group or others
+
+    Mirrors ssh: a key file other users can read is refused outright, so a
+    wrong chmod cannot go unnoticed. Skipped on Windows, where the mode
+    bits carry no meaning.
+    """
+    if _sys.platform == 'win32':
+        return
+    try:
+        mode = _os.stat(path).st_mode & 0o777
+    except OSError:
+        return  # missing/unreadable file is reported later by load_cert_chain
+    if not mode & 0o077:
+        return
+    message = (
+        f"private key {path} is accessible by other users ({mode:04o}), "
+        f"run: chmod 600 {path}")
+    if insecure:
+        if log:
+            log.warning(message)
+        return
+    raise _ConnError(f"{message} (or use --tls-insecure)")
+
+
+def resolve_tls(tls, log=None) -> dict:
+    """Normalize a TLS configuration dict
+
+    Expands a 'profile' name into cert / key / ca paths from the
+    certificate store and validates private key permissions. Explicitly
+    given paths always win over the ones coming from a profile.
+
+    Arguments:
+        tls: True for defaults, or a dict with any of: profile, cert, key,
+            ca, insecure, check_hostname, key_password
+        log: logger for warnings
+
+    Returns:
+        new dict without the 'profile' key (input is not modified)
+    """
+    if tls is True:
+        tls = {}
+    if not isinstance(tls, dict):
+        raise ValueError(
+            f"tls must be a dict or True, not {type(tls).__name__}")
+    unknown = set(tls) - _TLS_KEYS
+    if unknown:
+        raise ValueError(
+            f"unknown tls option(s): {', '.join(sorted(unknown))} "
+            f"(expected: {', '.join(sorted(_TLS_KEYS))})")
+    tls = dict(tls)
+    profile = tls.pop('profile', None)
+    if profile:
+        cert, key, ca = resolve_cert_profile(profile)
+        tls.setdefault('cert', cert)
+        if key:
+            tls.setdefault('key', key)
+        if ca:
+            tls.setdefault('ca', ca)
+    # Without a separate key file the private key lives in the cert file
+    key_file = tls.get('key') or tls.get('cert')
+    if key_file:
+        _check_key_permissions(key_file, tls.get('insecure', False), log)
+    return tls
