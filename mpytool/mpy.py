@@ -1578,6 +1578,17 @@ def _mt_appimg(label, size=256):
         self._conn.close()
         _time.sleep(RESET_DELAY_MS / 1000 + RESET_SETTLE)
 
+    def _check_reconnect(self, reconnect):
+        """Fail before touching the device if reconnect can't be honored
+
+        Raises:
+            NotImplementedError: if reconnect is requested on a connection
+                that doesn't support it
+        """
+        if reconnect and not self._conn.can_reconnect:
+            raise NotImplementedError(
+                "Reconnect not available on this connection")
+
     def machine_reset(self, reconnect=True, timeout=None):
         """MCU reset using machine.reset()
 
@@ -1591,8 +1602,13 @@ def _mt_appimg(label, size=256):
         Returns:
             True if reconnected successfully, False otherwise
 
+        Raises:
+            NotImplementedError: if reconnect is requested on a connection
+                that doesn't support it (the device is not reset)
+
         Note: For USB-CDC ports, the port may disappear and reappear.
         """
+        self._check_reconnect(reconnect)
         self._machine_call_after_close('reset')
         if reconnect:
             self._conn.reconnect(timeout=timeout)
@@ -1618,7 +1634,12 @@ def _mt_appimg(label, size=256):
 
         Returns:
             True if reconnected after reset, False otherwise
+
+        Raises:
+            NotImplementedError: if reconnect is requested on a connection
+                that doesn't support it (nothing is deleted)
         """
+        self._check_reconnect(reconnect)
         for name, _ in self.ls('/'):
             path = '/' + name
             if on_delete is not None:

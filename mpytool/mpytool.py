@@ -875,6 +875,10 @@ class MpyTool():
                     self.mpy.machine_reset(
                         reconnect=True, timeout=timeout)
                     self.verbose("  connected", 1, color='green')
+                except NotImplementedError as err:
+                    raise _mpytool.MpyError(
+                        f"Machine reset not sent: {err}, "
+                        "reset --machine must be the last command")
                 except (_mpytool.ConnError, OSError) as err:
                     self.verbose(
                         f"  reconnect failed: {err}", 1, color='red')
@@ -905,6 +909,9 @@ class MpyTool():
             self.mpy.wipe(
                 reconnect=reconnect, timeout=timeout,
                 on_delete=lambda path: self.verbose(f"  rm {path}", 1))
+        except NotImplementedError as err:
+            raise _mpytool.MpyError(
+                f"Wipe not started: {err}, wipe must be the last command")
         except (_mpytool.ConnError, OSError) as err:
             self.verbose(f"  reconnect failed: {err}", 1, color='red')
             raise _mpytool.ConnError(f"Reconnect failed: {err}")

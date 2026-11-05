@@ -974,6 +974,11 @@ device leaves USB, and the call blocks about 0.8 s until it should be gone.
 `machine_bootloader()` and `wipe()` behave the same way. With `reconnect=False`
 the connection stays **closed**; call `conn.reconnect()` to reopen it.
 
+**Raises:**
+- `NotImplementedError`: If `reconnect=True` on a connection without reconnect
+  support (`conn.can_reconnect` is False, e.g. `ConnSocket`). The device is not
+  reset, and `wipe()` deletes nothing.
+
 #### hard_reset()
 
 Hardware reset using RTS signal (serial only).

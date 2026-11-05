@@ -19,6 +19,7 @@ except ImportError:  # Windows has no termios
 
 class ConnSerial(_conn.Conn):
     RECONNECT_TIMEOUT = 10  # seconds
+    can_reconnect = True
 
     def __init__(self, log=None, **serial_config):
         super().__init__(log)

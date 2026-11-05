@@ -18,6 +18,8 @@ class Timeout(ConnError):
 
 
 class Conn():
+    can_reconnect = False  # True if reconnect() is implemented
+
     def __init__(self, log=None):
         self._log = log if log is not None else _SimpleColorLogger()
         self._buffer = bytearray()

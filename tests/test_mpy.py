@@ -559,6 +559,18 @@ class TestDelayedMachineReset(unittest.TestCase):
         self.conn.close.assert_not_called()
         self.conn.reconnect.assert_not_called()
 
+    def test_reconnect_unsupported_leaves_device_alone(self):
+        self.conn.can_reconnect = False
+        with self.assertRaises(NotImplementedError):
+            self.mpy.machine_reset(reconnect=True)
+        self.comm.exec.assert_not_called()
+        self.conn.close.assert_not_called()
+
+    def test_no_reconnect_works_without_reconnect_support(self):
+        self.conn.can_reconnect = False
+        self.assertFalse(self.mpy.machine_reset(reconnect=False))
+        self.conn.close.assert_called_once()
+
     def test_bootloader_closes_then_waits(self):
         self.mpy.machine_bootloader()
         self.assertEqual(
@@ -579,6 +591,21 @@ class TestWipe(unittest.TestCase):
         self.mpy.ls = Mock(return_value=[])
         self.mpy.delete = Mock()
         self.mpy.machine_reset = Mock(return_value=True)
+
+    def test_wipe_reconnect_unsupported_deletes_nothing(self):
+        """Files must survive a wipe that could not finish anyway"""
+        self.mock_conn.can_reconnect = False
+        self.mpy.ls.return_value = [('main.py', 10)]
+        with self.assertRaises(NotImplementedError):
+            self.mpy.wipe(reconnect=True)
+        self.mpy.delete.assert_not_called()
+        self.mpy.machine_reset.assert_not_called()
+
+    def test_wipe_no_reconnect_works_without_reconnect_support(self):
+        self.mock_conn.can_reconnect = False
+        self.mpy.ls.return_value = [('main.py', 10)]
+        self.mpy.wipe(reconnect=False)
+        self.mpy.delete.assert_called_once_with('/main.py')
 
     def test_wipe_deletes_all_root_entries(self):
         """wipe deletes every root entry using an absolute path"""

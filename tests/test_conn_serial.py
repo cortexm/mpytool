@@ -48,6 +48,7 @@ class TestCloseThenReconnect(unittest.TestCase):
     @patch('mpytool.conn_serial._serial.Serial')
     def test_reconnect_reopens_closed_port(self, mock_serial, _sleep):
         c = ConnSerial(port='/dev/ttyTEST')
+        self.assertTrue(c.can_reconnect)
         c.close()
         mock_serial.reset_mock()
         self.assertTrue(c.reconnect(timeout=1))

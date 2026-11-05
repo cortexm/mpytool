@@ -13,8 +13,10 @@ Run all device tests (dedicated test device):
 """
 
 import os
+import socket
 import subprocess
 import tempfile
+import threading
 import shutil
 import unittest
 
@@ -231,6 +233,39 @@ class TestCliErrors(unittest.TestCase):
             'usage' in result.stdout.lower() or
             'usage' in result.stderr.lower() or
             len(result.stderr) > 0)
+
+
+class TestCliReconnectUnsupported(unittest.TestCase):
+    """A TCP connection can't reconnect: refuse a reset that must be followed
+    by more commands, cleanly and without sending the device anything"""
+
+    def setUp(self):
+        self.received = bytearray()
+        self.listener = socket.create_server(('127.0.0.1', 0))
+        self.addCleanup(self.listener.close)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        self.address = f"127.0.0.1:{self.listener.getsockname()[1]}"
+
+    def _serve(self):
+        client, _ = self.listener.accept()
+        with client:
+            while data := client.recv(4096):
+                self.received += data
+
+    def _assert_refused(self, *commands):
+        result = run_mpytool('-a', self.address, *commands)
+        self.thread.join(timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertIn('must be the last command', result.stderr)
+        self.assertEqual(self.received, b'')
+
+    def test_reset_machine_followed_by_command(self):
+        self._assert_refused('reset', '--machine', '--', 'sleep', '0')
+
+    def test_wipe_followed_by_command(self):
+        self._assert_refused('wipe', '--', 'sleep', '0')
 
 
 class TestCliCompletion(unittest.TestCase):
