@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import mpytool
 from mpytool.mpytool import MpyTool, ParamsError
 from mpytool.cmd_cp import CopyCommand
 from mpytool.mpy_cross import MpyCross
@@ -903,6 +904,7 @@ class TestMpyCompilation(unittest.TestCase):
             f.write(compiled_data)
         self.compiler.compiled[self.script_py] = cache_path
         self.tool._mpy.put.return_value = (set(), 0)
+        self.tool._mpy.ls.return_value = []
         # Use CopyCommand with mpy_cross
         copy_cmd = CopyCommand(
             self.tool._mpy, self.tool._log,
@@ -973,6 +975,97 @@ class TestMpyCompilation(unittest.TestCase):
         self.assertTrue(call_kwargs['force'])
         self.assertTrue(call_kwargs['mpy'])
         # After cmd_cp finishes (even with mock), flags should be restored
+
+
+class TestRemoveShadowingPy(unittest.TestCase):
+    """cp -m must delete X.py next to an uploaded X.mpy: MicroPython imports
+    the .py first, so the compiled module would never load"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir)
+        self.src = os.path.join(self.temp_dir, 'script.py')
+        with open(self.src, 'w') as f:
+            f.write('x = 1\n')
+        cache = os.path.join(self.temp_dir, 'script.mpy-6.3.mpy')
+        with open(cache, 'wb') as f:
+            f.write(b'M\x06compiled')
+        self.mpy = Mock()
+        self.mpy.put.return_value = (set(), 0)
+        self.mpy.ls.return_value = [
+            ('script.py', 6), ('other.py', 3), ('lib', None)]
+        self.cmd = CopyCommand(
+            self.mpy, Mock(), Mock(), lambda: False, lambda: 0)
+        self.cmd._mpy_cross = Mock(compiled={self.src: cache})
+        self.cmd._force = True
+
+    def _upload(self, dst):
+        with open(self.src, 'rb') as f:
+            return self.cmd._upload_file(f.read(), self.src, dst, False)
+
+    def test_deletes_shadowing_py_after_upload(self):
+        self._upload('/app/script.py')
+        self.mpy.ls.assert_called_once_with('/app')
+        self.mpy.delete.assert_called_once_with('/app/script.py')
+        calls = [c[0] for c in self.mpy.mock_calls]
+        self.assertLess(calls.index('put'), calls.index('delete'))
+
+    def test_root_directory(self):
+        self._upload('/script.py')
+        self.mpy.ls.assert_called_once_with('/')
+        self.mpy.delete.assert_called_once_with('/script.py')
+
+    def test_relative_path_lists_cwd(self):
+        self._upload('script.py')
+        self.mpy.ls.assert_called_once_with('')
+        self.mpy.delete.assert_called_once_with('script.py')
+
+    def test_no_py_on_device_deletes_nothing(self):
+        self.mpy.ls.return_value = [('other.py', 3)]
+        self._upload('/script.py')
+        self.mpy.delete.assert_not_called()
+
+    def test_directory_named_like_module_is_kept(self):
+        self.mpy.ls.return_value = [('script.py', None)]
+        self._upload('/script.py')
+        self.mpy.delete.assert_not_called()
+
+    def test_missing_directory_deletes_nothing(self):
+        self.mpy.ls.side_effect = mpytool.DirNotFound('/app')
+        self._upload('/app/script.py')
+        self.mpy.delete.assert_not_called()
+
+    def test_failed_upload_keeps_py(self):
+        self.mpy.put.side_effect = mpytool.MpyError('write failed')
+        with self.assertRaises(mpytool.MpyError):
+            self._upload('/script.py')
+        self.mpy.delete.assert_not_called()
+
+    def test_skipped_unchanged_mpy_still_removes_py(self):
+        self.cmd._force = False
+        self.cmd._file_needs_update = Mock(return_value=False)
+        self.assertFalse(self._upload('/script.py'))
+        self.mpy.put.assert_not_called()
+        self.mpy.delete.assert_called_once_with('/script.py')
+
+    def test_uncompiled_py_is_never_deleted(self):
+        """boot.py/main.py or a failed compile upload as .py, nothing to hide"""
+        self.cmd._mpy_cross = Mock(compiled={})
+        self._upload('/script.py')
+        self.mpy.ls.assert_not_called()
+        self.mpy.delete.assert_not_called()
+
+    def test_directory_listed_once(self):
+        self._upload('/script.py')
+        self._upload('/script.py')
+        self.mpy.ls.assert_called_once_with('/')
+        self.mpy.delete.assert_called_once_with('/script.py')
+
+    def test_listing_cache_is_per_command(self):
+        self._upload('/script.py')
+        with patch.object(self.cmd, '_run_impl'):
+            self.cmd.run(['x', ':/'])
+        self.assertEqual(self.cmd._remote_dir_files, {})
 
 
 if __name__ == "__main__":

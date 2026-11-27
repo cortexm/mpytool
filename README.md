@@ -156,6 +156,9 @@ Compiled files are cached in `__pycache__/` (recompiled only when source changes
 Requires `mpy-cross` in PATH (`pip install mpy-cross`). If mpy-cross version differs
 from device, automatically uses `-b` flag to target the correct bytecode version.
 If `mpy-cross` is not found, falls back to uploading `.py` with a warning.
+MicroPython imports `name.py` before `name.mpy`, so a `name.py` left on the device
+next to an uploaded `name.mpy` is deleted (`rm :name.py (shadows name.mpy)`),
+also when the `.mpy` itself was unchanged and skipped.
 
 ### Deploy project (sync)
 

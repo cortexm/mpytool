@@ -78,6 +78,7 @@ class CopyCommand:
 
         # Cache
         self._remote_file_cache = {}
+        self._remote_dir_files = {}  # {remote_dir: set of file names}, per run
 
         # Info mode disables progress overwrite (each update on new line)
         self._is_info = self._log.is_info
@@ -420,16 +421,43 @@ class CopyCommand:
             return True  # hashlib not available on device
         return local_hash != remote_hash
 
+    def _remove_shadowing_py(self, py_path):
+        """Delete py_path on device if it exists next to its uploaded .mpy
+
+        MicroPython imports name.py before name.mpy, so a .py left there from
+        an earlier upload would hide the compiled module completely.
+        Each remote directory is listed only once per cp command.
+        """
+        parent, _, name = py_path.rpartition('/')
+        if not parent and py_path.startswith('/'):
+            parent = '/'
+        files = self._remote_dir_files.get(parent)
+        if files is None:
+            try:
+                entries = self.mpy.ls(parent)
+            except _mpytool.DirNotFound:
+                entries = []
+            files = {n for n, size in entries if size is not None}
+            self._remote_dir_files[parent] = files
+        if name not in files:
+            return
+        self.mpy.delete(py_path)
+        files.discard(name)
+        self.verbose(
+            f"rm :{py_path} (shadows {name[:-3]}.mpy)", color='yellow')
+
     # --- Transfer operations ---
 
     def _upload_file(self, data, src_path, dst_path, show_progress):
         """Upload file data to device with stats and progress"""
         # Use compiled .mpy data if available
         cache = self._mpy_cross and self._mpy_cross.compiled.get(src_path)
+        shadow_py = None
         if cache:
             with open(cache, 'rb') as f:
                 data = f.read()
             if dst_path.endswith('.py'):
+                shadow_py = dst_path
                 dst_path = dst_path[:-3] + '.mpy'
         file_size = len(data)
         self._stats_total_bytes += file_size
@@ -451,6 +479,9 @@ class CopyCommand:
             elif show_progress and self._verbose >= 1:
                 # Erase CHCK line (next file's progress will overwrite)
                 self.verbose("", end='', overwrite=True)
+            # An unchanged .mpy can still be hidden by a stale .py
+            if shadow_py:
+                self._remove_shadowing_py(shadow_py)
             return False  # skipped
         self._stats_transferred_bytes += file_size
         self._stats_transferred_files += 1
@@ -462,6 +493,9 @@ class CopyCommand:
         else:
             _, wire = self.mpy.put(data, dst_path, compress=self._compress)
             self._stats_wire_bytes += wire
+        # Only after a successful upload, so a failure leaves a working .py
+        if shadow_py:
+            self._remove_shadowing_py(shadow_py)
         return True  # uploaded
 
     def _put_dir(
@@ -672,6 +706,8 @@ class CopyCommand:
         # Save and set flags for this command
         self._force = force
         self._compress = compress
+        # The device may change between commands (e.g. cp -- rm -- cp)
+        self._remote_dir_files = {}
         if mpy:
             self._mpy_cross = MpyCross(self._log)
 
